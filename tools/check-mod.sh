@@ -63,10 +63,38 @@ EOF
 
 cat > "$stubs/windhawk_utils.h" <<'EOF'
 #pragma once
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
 namespace WindhawkUtils {
 template <typename P>
 inline bool SetFunctionHook(P target, P hook, P* original) {
     return Wh_SetFunctionHook((void*)target, (void*)hook, (void**)original);
+}
+
+struct SYMBOL_HOOK {
+    std::vector<std::wstring_view> symbols;
+    void** pOriginalFunction;
+    void* hookFunction = nullptr;
+    bool optional = false;
+
+    template <typename Prototype>
+    SYMBOL_HOOK(std::vector<std::wstring_view> symbols,
+                Prototype** originalFunction,
+                std::type_identity_t<Prototype*> hookFunction = nullptr,
+                bool optional = false)
+        : symbols(std::move(symbols)),
+          pOriginalFunction(reinterpret_cast<void**>(originalFunction)),
+          hookFunction(reinterpret_cast<void*>(hookFunction)),
+          optional(optional) {}
+};
+
+inline bool HookSymbols(HMODULE module,
+                        const SYMBOL_HOOK* symbolHooks,
+                        size_t symbolHooksCount,
+                        const void* options = nullptr) {
+    return false;
 }
 }  // namespace WindhawkUtils
 EOF

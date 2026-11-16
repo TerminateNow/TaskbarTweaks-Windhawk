@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.0
+// @version         1.1
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -44,20 +44,37 @@ listed in more than one folder, the first folder wins.
 * The folder sits where its first closed app is pinned. The apps listed after
   it are hidden from the taskbar.
 * Clicking the folder opens its menu. Click an app to open it.
+* Drag the folder to move it, like any other pinned icon. This moves the app
+  the folder sits on, so the folder stays in its new spot.
 * Click ❌ next to an app to take it out of the folder and put it back on the
   taskbar. To put it back in the folder, edit that folder's app list in the
   mod settings: any change to a folder's app list brings back every app you
   removed from it with ❌.
-* Apps that are open aren't listed in the folder menu. They get their own
-  taskbar icon while they run and go back into the folder when you close them.
+* An open app gets its own taskbar icon and also stays in the folder menu,
+  marked as open. Clicking it in the menu switches to it.
 
 ## Limitations
 
 * Windows 11 taskbar only. The Windows 10 taskbar, and the Windows 10 taskbar
   restored by ExplorerPatcher, aren't supported.
+* The folder needs at least one of its apps to be closed, since it sits on that
+  app's taskbar spot. While every app in a folder is open, the folder is hidden
+  and each app shows on its own.
 * Keyboard shortcuts such as Win+1 still launch the app the folder sits on.
-* The folder icon can't be dragged to a new position. To move a folder, move
-  its first app on the taskbar.
+* Dragging the folder and opening its menu with a left click rely on Windows'
+  debugging symbols for the taskbar, which Windhawk downloads the first time
+  the mod loads. If that fails, the folder still opens its menu when clicked
+  but can't be dragged.
+
+## If an app isn't added to its folder
+
+Open Windhawk's log for this mod. Every taskbar icon is logged with its app ID,
+name, program file and pinned shortcut name, in this form:
+
+`App <app ID>: name '<name>', exe '<program file>', shortcut '<shortcut name>'`
+
+Any of those values can be used in the folder's app list. Lines like
+`<app ID>: in folder <folder name>` show which folder each app was put in.
 */
 // ==/WindhawkModReadme==
 
@@ -106,9 +123,11 @@ listed in more than one folder, the first folder wins.
 #include <xamlom.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -122,6 +141,8 @@ listed in more than one folder, the first folder wins.
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Text.h>
+#include <winrt/Windows.UI.Xaml.Automation.Peers.h>
+#include <winrt/Windows.UI.Xaml.Automation.Provider.h>
 #include <winrt/Windows.UI.Xaml.Automation.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
@@ -146,6 +167,11 @@ constexpr UINT kMenuIconPixels = 32;
 
 constexpr UINT kMsgUpdate = WM_APP + 1;
 constexpr UINT kMsgShowClassicMenu = WM_APP + 2;
+constexpr UINT kMsgShowFolderMenu = WM_APP + 3;
+
+// How far the pointer can move between pressing and releasing on a folder for
+// it to still count as a click rather than a drag.
+constexpr int kClickMoveThreshold = 12;
 
 constexpr UINT kCmdLaunchBase = 1000;
 constexpr UINT kCmdRemoveBase = 2000;
@@ -179,6 +205,20 @@ constexpr PROPERTYKEY kPKEY_Link_TargetParsingPath = {
      0x4a42,
      {0xb5, 0xd8, 0x32, 0x41, 0x46, 0xaf, 0xcf, 0x25}},
     2};
+
+// PKEY_AppUserModel_ID
+constexpr PROPERTYKEY kPKEY_AppUserModel_ID = {
+    {0x9f4c2855,
+     0x9f79,
+     0x4b39,
+     {0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3}},
+    5};
+
+constexpr CLSID kCLSID_ShellLink = {
+    0x00021401,
+    0x0000,
+    0x0000,
+    {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Global state. Everything below the settings is only touched on the taskbar's
@@ -220,7 +260,17 @@ struct ButtonState {
     bool setUp = false;
     int64_t automationIdToken = 0;
     winrt::event_token loadedToken{};
-    winrt::event_token dragStartingToken{};
+    // Added with handledEventsToo to see every press and release, including
+    // the ones the taskbar handles itself.
+    wux::Input::PointerEventHandler pointerDownHandler{nullptr};
+    wux::Input::PointerEventHandler pointerUpHandler{nullptr};
+
+    // While the pointer is down on a button (e.g. while it's being dragged),
+    // the taskbar can hide its running indicator. Its running state is frozen
+    // meanwhile so that an open app doesn't briefly turn into the folder.
+    bool pointerDown = false;
+    ULONGLONG pointerDownTime = 0;
+    bool frozenRunning = false;
 
     bool templateAttached = false;
     winrt::weak_ref<wux::FrameworkElement> templateRoot;
@@ -257,15 +307,31 @@ std::vector<std::unique_ptr<ButtonState>> g_buttons;
 struct AppInfo {
     std::wstring displayName;
     std::wstring exeLower;
+    // The app's shortcut in the taskbar's pinned items folder, if any.
+    std::wstring shortcutName;
+    std::wstring shortcutPath;
 };
 
 std::unordered_map<std::wstring, AppInfo> g_appInfoCache;
 std::unordered_map<int, wux::Media::ImageSource> g_folderIcons;
 std::unordered_map<std::wstring, wux::Media::ImageSource> g_appIcons;
 
+struct PinnedShortcut {
+    std::wstring path;
+    std::wstring name;
+    std::wstring appIdLower;
+    std::wstring targetLower;
+};
+
+std::vector<PinnedShortcut> g_pinnedShortcuts;
+ULONGLONG g_pinnedShortcutsLoadTime = 0;
+
 struct MenuEntry {
     std::wstring appId;
     std::wstring name;
+    bool running = false;
+    // The app's taskbar button, used to switch to it while it's open.
+    void* buttonKey = nullptr;
 };
 
 struct PendingClassicMenu {
@@ -285,6 +351,29 @@ struct PressState {
 
 PressState g_press;
 
+// A left or middle press on a folder. When the taskbar then tries to launch
+// the app the folder sits on (CTaskBand::Launch), the launch is replaced with
+// the folder menu. A drag doesn't launch anything, so the folder can be moved
+// like any other icon.
+struct HostClickState {
+    bool active = false;
+    void* key = nullptr;
+    POINT pressPoint{};
+    ULONGLONG pressTime = 0;
+    ULONGLONG releaseTime = 0;
+};
+
+HostClickState g_hostClick;
+void* g_menuRequestKey = nullptr;
+
+using CTaskBand_Launch_t = long(WINAPI*)(void* pThis,
+                                         void* taskGroup,
+                                         void* point,
+                                         int options);
+CTaskBand_Launch_t CTaskBand_Launch_Original;
+bool g_launchHooked = false;
+
+DWORD g_uiThreadId = 0;
 HWND g_hwnd = nullptr;
 bool g_updatePending = false;
 std::atomic<bool> g_unloading = false;
@@ -608,6 +697,104 @@ winrt::com_ptr<IShellItem> CreateAppShellItem(const std::wstring& appId) {
     return nullptr;
 }
 
+// Taskbar pins are stored as shortcuts in this folder. They're the most
+// reliable way to identify and launch a pinned app: some apps, such as Steam,
+// use an app ID that the Start menu's app list doesn't know.
+void LoadPinnedShortcuts() {
+    g_pinnedShortcuts.clear();
+    g_pinnedShortcutsLoadTime = GetTickCount64();
+
+    WCHAR appData[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr,
+                                SHGFP_TYPE_CURRENT, appData))) {
+        return;
+    }
+
+    std::wstring folder = appData;
+    folder += L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\\";
+
+    WIN32_FIND_DATAW findData;
+    HANDLE find = FindFirstFileW((folder + L"*.lnk").c_str(), &findData);
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            continue;
+        }
+
+        PinnedShortcut shortcut;
+        shortcut.path = folder + findData.cFileName;
+        shortcut.name = findData.cFileName;
+        if (EndsWithI(shortcut.name, L".lnk")) {
+            shortcut.name.resize(shortcut.name.size() - 4);
+        }
+
+        winrt::com_ptr<IShellLinkW> link;
+        if (FAILED(CoCreateInstance(kCLSID_ShellLink, nullptr,
+                                    CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(link.put())))) {
+            continue;
+        }
+
+        auto persistFile = link.try_as<IPersistFile>();
+        if (!persistFile ||
+            FAILED(persistFile->Load(shortcut.path.c_str(), STGM_READ))) {
+            continue;
+        }
+
+        WCHAR target[MAX_PATH * 2]{};
+        if (SUCCEEDED(link->GetPath(target, ARRAYSIZE(target), nullptr,
+                                    SLGP_RAWPATH)) &&
+            target[0]) {
+            shortcut.targetLower = ToLower(ExpandEnvironment(target));
+        }
+
+        if (auto store = link.try_as<IPropertyStore>()) {
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            if (SUCCEEDED(store->GetValue(kPKEY_AppUserModel_ID, &value)) &&
+                value.vt == VT_LPWSTR && value.pwszVal) {
+                shortcut.appIdLower = ToLower(value.pwszVal);
+            }
+            PropVariantClear(&value);
+        }
+
+        g_pinnedShortcuts.push_back(std::move(shortcut));
+    } while (FindNextFileW(find, &findData));
+
+    FindClose(find);
+}
+
+std::optional<PinnedShortcut> FindPinnedShortcut(const std::wstring& appId) {
+    if (g_pinnedShortcutsLoadTime == 0 ||
+        GetTickCount64() - g_pinnedShortcutsLoadTime > 5000) {
+        LoadPinnedShortcuts();
+    }
+
+    // A shortcut with an explicit app ID matches by it. Otherwise the taskbar
+    // derives the app ID from the program's path.
+    std::wstring appIdLower = ToLower(appId);
+    for (const auto& shortcut : g_pinnedShortcuts) {
+        if (!shortcut.appIdLower.empty() && shortcut.appIdLower == appIdLower) {
+            return shortcut;
+        }
+    }
+
+    std::wstring pathLower = ToLower(AppIdToPath(appId));
+    if (!pathLower.empty()) {
+        for (const auto& shortcut : g_pinnedShortcuts) {
+            if (shortcut.appIdLower.empty() &&
+                shortcut.targetLower == pathLower) {
+                return shortcut;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
 const AppInfo& GetAppInfo(const std::wstring& appId) {
     std::wstring key = ToLower(appId);
     auto it = g_appInfoCache.find(key);
@@ -638,6 +825,14 @@ const AppInfo& GetAppInfo(const std::wstring& appId) {
         }
     }
 
+    if (auto shortcut = FindPinnedShortcut(appId)) {
+        info.shortcutName = shortcut->name;
+        info.shortcutPath = shortcut->path;
+        if (info.exeLower.empty() && EndsWithI(shortcut->targetLower, L".exe")) {
+            info.exeLower = FileNameOf(shortcut->targetLower);
+        }
+    }
+
     if (info.exeLower.empty()) {
         std::wstring path = AppIdToPath(appId);
         const std::wstring& source = path.empty() ? appId : path;
@@ -646,44 +841,66 @@ const AppInfo& GetAppInfo(const std::wstring& appId) {
         }
     }
 
-    Wh_Log(L"App %s: name '%s', exe '%s'", appId.c_str(),
-           info.displayName.c_str(), info.exeLower.c_str());
+    // A folder entry matching the app's name should work even when the Start
+    // menu doesn't know the app.
+    if (info.displayName.empty()) {
+        info.displayName = info.shortcutName;
+    }
+
+    Wh_Log(L"App %s: name '%s', exe '%s', shortcut '%s'", appId.c_str(),
+           info.displayName.c_str(), info.exeLower.c_str(),
+           info.shortcutName.c_str());
 
     return g_appInfoCache.emplace(std::move(key), std::move(info))
         .first->second;
 }
 
+struct LaunchParams {
+    std::wstring appId;
+    std::wstring shortcutPath;
+};
+
+// Launches the app the way the taskbar does for a pinned app: through its
+// pinned shortcut when there is one, otherwise through the Start menu's app
+// list or the program's path.
 void LaunchApp(const std::wstring& appId) {
-    auto* param = new std::wstring(appId);
+    auto* params = new LaunchParams{appId, GetAppInfo(appId).shortcutPath};
     HANDLE thread = CreateThread(
         nullptr, 0,
         [](LPVOID lpParam) -> DWORD {
-            std::unique_ptr<std::wstring> appId(
-                static_cast<std::wstring*>(lpParam));
+            std::unique_ptr<LaunchParams> params(
+                static_cast<LaunchParams*>(lpParam));
 
             HRESULT hrCoInit = CoInitializeEx(
                 nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-            std::wstring target = L"shell:AppsFolder\\" + *appId;
+            std::vector<std::wstring> targets;
+            if (!params->shortcutPath.empty()) {
+                targets.push_back(params->shortcutPath);
+            }
+            targets.push_back(L"shell:AppsFolder\\" + params->appId);
+            std::wstring path = AppIdToPath(params->appId);
+            if (!path.empty()) {
+                targets.push_back(path);
+            }
 
-            SHELLEXECUTEINFOW sei{};
-            sei.cbSize = sizeof(sei);
-            sei.fMask = SEE_MASK_FLAG_NO_UI;
-            sei.lpFile = target.c_str();
-            sei.nShow = SW_SHOWNORMAL;
-            BOOL launched = ShellExecuteExW(&sei);
-
-            if (!launched) {
-                std::wstring path = AppIdToPath(*appId);
-                if (!path.empty()) {
-                    sei.lpFile = path.c_str();
-                    launched = ShellExecuteExW(&sei);
+            bool launched = false;
+            for (const auto& target : targets) {
+                SHELLEXECUTEINFOW sei{};
+                sei.cbSize = sizeof(sei);
+                sei.fMask = SEE_MASK_FLAG_NO_UI;
+                sei.lpFile = target.c_str();
+                sei.nShow = SW_SHOWNORMAL;
+                if (ShellExecuteExW(&sei)) {
+                    launched = true;
+                    break;
                 }
+                Wh_Log(L"Couldn't launch %s: %u", target.c_str(),
+                       GetLastError());
             }
 
             if (!launched) {
-                Wh_Log(L"Failed to launch %s: %u", appId->c_str(),
-                       GetLastError());
+                Wh_Log(L"Failed to launch %s", params->appId.c_str());
             }
 
             if (SUCCEEDED(hrCoInit)) {
@@ -692,12 +909,12 @@ void LaunchApp(const std::wstring& appId) {
 
             return 0;
         },
-        param, 0, nullptr);
+        params, 0, nullptr);
 
     if (thread) {
         CloseHandle(thread);
     } else {
-        delete param;
+        delete params;
     }
 }
 
@@ -1103,10 +1320,11 @@ void OnIconSourceChanged(void* key, wux::DependencyObject const& sender) {
 
 std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
     std::vector<ButtonState*> members;
+    // Open apps are listed too: they have their own taskbar icon while they
+    // run, but they stay in the folder.
     for (auto& button : g_buttons) {
         if (button->folder == host->folder &&
-            button->rootKey == host->rootKey && !button->running &&
-            !button->appId.empty()) {
+            button->rootKey == host->rootKey && !button->appId.empty()) {
             members.push_back(button.get());
         }
     }
@@ -1127,6 +1345,8 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
 
         MenuEntry entry;
         entry.appId = member->appId;
+        entry.running = member->running;
+        entry.buttonKey = member->key;
         entry.name = GetAppInfo(member->appId).displayName;
         if (entry.name.empty()) {
             entry.name = member->automationName;
@@ -1138,6 +1358,53 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
     }
 
     return entries;
+}
+
+// Clicks the app's own taskbar button, which switches to the app (or shows its
+// windows) exactly like clicking it on the taskbar.
+bool InvokeTaskbarButton(void* buttonKey) {
+    ButtonState* button = FindButton(buttonKey);
+    if (!button) {
+        return false;
+    }
+
+    auto element = button->element.get();
+    if (!element || element.Visibility() != wux::Visibility::Visible) {
+        return false;
+    }
+
+    namespace peers = wux::Automation::Peers;
+    auto peer = peers::FrameworkElementAutomationPeer::CreatePeerForElement(
+        element);
+    if (!peer) {
+        return false;
+    }
+
+    auto invoke = peer.GetPattern(peers::PatternInterface::Invoke)
+                      .try_as<wux::Automation::Provider::IInvokeProvider>();
+    if (!invoke) {
+        return false;
+    }
+
+    invoke.Invoke();
+    return true;
+}
+
+void OpenMenuEntry(const MenuEntry& entry) {
+    if (entry.running) {
+        bool invoked = false;
+        try {
+            invoked = InvokeTaskbarButton(entry.buttonKey);
+        } catch (...) {
+            Wh_Log(L"Invoking the taskbar button failed: %08X",
+                   winrt::to_hresult());
+        }
+        if (invoked) {
+            return;
+        }
+    }
+
+    LaunchApp(entry.appId);
 }
 
 void HideFolderMenu() {
@@ -1222,6 +1489,15 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
         label.TextTrimming(wux::TextTrimming::CharacterEllipsis);
         content.Children().Append(label);
 
+        if (entry.running) {
+            wuxc::TextBlock openLabel;
+            openLabel.Text(L"Open");
+            openLabel.FontSize(11);
+            openLabel.Opacity(0.6);
+            openLabel.VerticalAlignment(wux::VerticalAlignment::Center);
+            content.Children().Append(openLabel);
+        }
+
         wuxc::Button openButton;
         openButton.Content(content);
         openButton.HorizontalAlignment(wux::HorizontalAlignment::Stretch);
@@ -1230,11 +1506,13 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
         openButton.BorderThickness(wux::Thickness{0, 0, 0, 0});
         openButton.Padding(wux::Thickness{8, 6, 8, 6});
         wux::Automation::AutomationProperties::SetName(
-            openButton, winrt::hstring(L"Open " + entry.name));
-        openButton.Click([appId](auto const&, auto const&) {
+            openButton,
+            winrt::hstring((entry.running ? L"Switch to " : L"Open ") +
+                           entry.name));
+        openButton.Click([entry](auto const&, auto const&) {
             Guarded([&] {
                 HideFolderMenu();
-                LaunchApp(appId);
+                OpenMenuEntry(entry);
             });
         });
 
@@ -1323,7 +1601,11 @@ void ShowClassicMenuNow() {
 
     for (size_t i = 0; i < pending.entries.size(); i++) {
         UINT id = kCmdLaunchBase + static_cast<UINT>(i);
-        AppendMenuW(menu, MF_STRING, id, pending.entries[i].name.c_str());
+        std::wstring text = pending.entries[i].name;
+        if (pending.entries[i].running) {
+            text += L"\t(open)";
+        }
+        AppendMenuW(menu, MF_STRING, id, text.c_str());
 
         if (HBITMAP bitmap =
                 CreateMenuBitmap(pending.entries[i].appId, iconSize)) {
@@ -1360,7 +1642,7 @@ void ShowClassicMenuNow() {
         RemoveFromFolder(pending.folder,
                          pending.entries[command - kCmdRemoveBase].appId);
     } else if (command >= kCmdLaunchBase && command < kCmdLaunchBase + count) {
-        LaunchApp(pending.entries[command - kCmdLaunchBase].appId);
+        OpenMenuEntry(pending.entries[command - kCmdLaunchBase]);
     }
 }
 
@@ -1390,19 +1672,31 @@ void ShowFolderMenu(ButtonState* host) {
     }
 }
 
+// Handlers on the template root, which run before the button's own handling.
+// With the launch hook, only right clicks on a folder are taken over here: a
+// left press goes through so that the folder can be dragged, and the click is
+// turned into the folder menu in CTaskBand_Launch_Hook. Without the hook, every
+// press on a folder is taken over, and the folder can't be dragged.
 void OnPointerPressed(void* key, wux::Input::PointerRoutedEventArgs const& e) {
     ButtonState* button = FindButton(key);
     if (!button || !button->isHost) {
         return;
     }
 
-    // Keep the taskbar from launching the app the folder sits on.
-    e.Handled(true);
-
     auto root = button->templateRoot.get();
     if (!root) {
         return;
     }
+
+    bool rightButton =
+        e.GetCurrentPoint(root).Properties().IsRightButtonPressed();
+    if (g_launchHooked && !rightButton) {
+        return;
+    }
+
+    // Keep the taskbar from launching the app the folder sits on, or from
+    // showing its jump list.
+    e.Handled(true);
 
     g_press.active = true;
     g_press.key = key;
@@ -1418,15 +1712,14 @@ void OnPointerReleased(void* key, wux::Input::PointerRoutedEventArgs const& e) {
 
     bool wasPressed = g_press.active && g_press.key == key &&
                       g_press.pointerId == e.Pointer().PointerId();
-    if (!button->isHost && !wasPressed) {
+    if (!wasPressed) {
+        if (button->isHost && !g_launchHooked) {
+            e.Handled(true);
+        }
         return;
     }
 
     e.Handled(true);
-
-    if (!wasPressed) {
-        return;
-    }
 
     g_press.active = false;
     if (auto root = button->templateRoot.get()) {
@@ -1447,6 +1740,96 @@ void OnPointerReleased(void* key, wux::Input::PointerRoutedEventArgs const& e) {
     }
 
     ShowFolderMenu(button);
+}
+
+// Handlers on the button itself, added with handledEventsToo, so they see
+// every press and release whoever handles it.
+void OnButtonPointerDown(void* key, wux::Input::PointerRoutedEventArgs const& e) {
+    ButtonState* button = FindButton(key);
+    if (!button) {
+        return;
+    }
+
+    if (!button->pointerDown) {
+        button->pointerDown = true;
+        button->pointerDownTime = GetTickCount64();
+        button->frozenRunning = button->running;
+    }
+
+    if (!g_launchHooked || !button->isHost) {
+        return;
+    }
+
+    auto element = button->element.get();
+    if (!element ||
+        e.GetCurrentPoint(element).Properties().IsRightButtonPressed()) {
+        return;
+    }
+
+    g_hostClick = HostClickState{};
+    g_hostClick.active = true;
+    g_hostClick.key = key;
+    GetCursorPos(&g_hostClick.pressPoint);
+    g_hostClick.pressTime = GetTickCount64();
+}
+
+void OnButtonPointerUp(void* key) {
+    ButtonState* button = FindButton(key);
+    if (!button) {
+        return;
+    }
+
+    if (button->pointerDown) {
+        button->pointerDown = false;
+        ScheduleUpdate();
+    }
+
+    if (g_hostClick.active && g_hostClick.key == key &&
+        !g_hostClick.releaseTime) {
+        g_hostClick.releaseTime = GetTickCount64();
+    }
+}
+
+// Called when the taskbar is about to launch a pinned app. Returns whether the
+// launch is a click on a folder, which should show its menu instead.
+bool TakeHostClick(void** key) {
+    if (!g_hostClick.active || g_unloading || !g_hwnd) {
+        return false;
+    }
+
+    HostClickState click = g_hostClick;
+    g_hostClick = HostClickState{};
+
+    ULONGLONG now = GetTickCount64();
+    bool recent = click.releaseTime ? now - click.releaseTime < 2000
+                                    : now - click.pressTime < 10000;
+
+    POINT point;
+    GetCursorPos(&point);
+    bool moved = std::abs(point.x - click.pressPoint.x) > kClickMoveThreshold ||
+                 std::abs(point.y - click.pressPoint.y) > kClickMoveThreshold;
+
+    if (!recent || moved) {
+        return false;
+    }
+
+    *key = click.key;
+    return true;
+}
+
+long WINAPI CTaskBand_Launch_Hook(void* pThis,
+                                  void* taskGroup,
+                                  void* point,
+                                  int options) {
+    void* key = nullptr;
+    if (TakeHostClick(&key)) {
+        Wh_Log(L"Showing a folder menu instead of launching");
+        g_menuRequestKey = key;
+        PostMessageW(g_hwnd, kMsgShowFolderMenu, 0, 0);
+        return 0;
+    }
+
+    return CTaskBand_Launch_Original(pThis, taskGroup, point, options);
 }
 
 bool IsHostButton(void* key) {
@@ -1496,14 +1879,23 @@ void SetUpButton(ButtonState* button, wux::FrameworkElement const& element) {
     button->loadedToken =
         element.Loaded([](auto const&, auto const&) { ScheduleUpdate(); });
 
-    button->dragStartingToken = element.DragStarting(
-        [key](wux::UIElement const&, wux::DragStartingEventArgs const& args) {
-            Guarded([&] {
-                if (IsHostButton(key)) {
-                    args.Cancel(true);
-                }
-            });
+    button->pointerDownHandler = wux::Input::PointerEventHandler(
+        [key](auto const&, wux::Input::PointerRoutedEventArgs const& e) {
+            Guarded([&] { OnButtonPointerDown(key, e); });
         });
+    button->pointerUpHandler = wux::Input::PointerEventHandler(
+        [key](auto const&, wux::Input::PointerRoutedEventArgs const&) {
+            Guarded([&] { OnButtonPointerUp(key); });
+        });
+
+    element.AddHandler(wux::UIElement::PointerPressedEvent(),
+                       winrt::box_value(button->pointerDownHandler), true);
+    element.AddHandler(wux::UIElement::PointerReleasedEvent(),
+                       winrt::box_value(button->pointerUpHandler), true);
+    element.AddHandler(wux::UIElement::PointerCaptureLostEvent(),
+                       winrt::box_value(button->pointerUpHandler), true);
+    element.AddHandler(wux::UIElement::PointerCanceledEvent(),
+                       winrt::box_value(button->pointerUpHandler), true);
 
     button->setUp = true;
 }
@@ -1550,7 +1942,9 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
     button->tappedToken = root.Tapped(
         [key](auto const&, wux::Input::TappedRoutedEventArgs const& e) {
             Guarded([&] {
-                if (IsHostButton(key)) {
+                // With the launch hook, a left click has to reach the taskbar
+                // for the hook to turn it into the folder menu.
+                if (!g_launchHooked && IsHostButton(key)) {
                     e.Handled(true);
                 }
             });
@@ -1558,7 +1952,9 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
     button->doubleTappedToken = root.DoubleTapped(
         [key](auto const&, wux::Input::DoubleTappedRoutedEventArgs const& e) {
             Guarded([&] {
-                if (IsHostButton(key)) {
+                // With the launch hook, a left click has to reach the taskbar
+                // for the hook to turn it into the folder menu.
+                if (!g_launchHooked && IsHostButton(key)) {
                     e.Handled(true);
                 }
             });
@@ -1640,8 +2036,19 @@ void DetachButton(ButtonState* button) {
             if (button->loadedToken) {
                 element.Loaded(button->loadedToken);
             }
-            if (button->dragStartingToken) {
-                element.DragStarting(button->dragStartingToken);
+            if (button->pointerDownHandler) {
+                element.RemoveHandler(
+                    wux::UIElement::PointerPressedEvent(),
+                    winrt::box_value(button->pointerDownHandler));
+            }
+            if (button->pointerUpHandler) {
+                auto handler = winrt::box_value(button->pointerUpHandler);
+                element.RemoveHandler(wux::UIElement::PointerReleasedEvent(),
+                                      handler);
+                element.RemoveHandler(
+                    wux::UIElement::PointerCaptureLostEvent(), handler);
+                element.RemoveHandler(wux::UIElement::PointerCanceledEvent(),
+                                      handler);
             }
         });
     }
@@ -1706,6 +2113,10 @@ void MatchFolder(ButtonState* button) {
     const AppInfo& info = GetAppInfo(button->appId);
     std::wstring displayNameLower = ToLower(info.displayName);
     std::wstring automationNameLower = ToLower(button->automationName);
+    // In case the accessible name has extra details after the app's name.
+    std::wstring automationNameShortLower = automationNameLower.substr(
+        0, automationNameLower.find(L" - "));
+    std::wstring shortcutNameLower = ToLower(info.shortcutName);
     std::wstring exeStem = StripExe(info.exeLower);
 
     for (size_t i = 0; i < g_settings.folders.size(); i++) {
@@ -1717,7 +2128,10 @@ void MatchFolder(ButtonState* button) {
                 (!info.exeLower.empty() &&
                  (entry == info.exeLower || entry == exeStem)) ||
                 (!displayNameLower.empty() && entry == displayNameLower) ||
-                (!automationNameLower.empty() && entry == automationNameLower);
+                (!shortcutNameLower.empty() && entry == shortcutNameLower) ||
+                (!automationNameLower.empty() &&
+                 (entry == automationNameLower ||
+                  entry == automationNameShortLower));
             if (!matches) {
                 continue;
             }
@@ -1762,7 +2176,14 @@ void RefreshButton(ButtonState* button) {
         button->automationName.clear();
     }
 
-    button->running = IsButtonRunning(button);
+    bool running = IsButtonRunning(button);
+    if (button->pointerDown &&
+        GetTickCount64() - button->pointerDownTime < 60 * 1000) {
+        running = button->frozenRunning;
+    } else {
+        button->pointerDown = false;
+    }
+    button->running = running;
     if (!button->running) {
         // While the app is closed, the accessible name is just the app's name.
         button->automationName = Trim(
@@ -1772,7 +2193,14 @@ void RefreshButton(ButtonState* button) {
     auto xamlRoot = element.XamlRoot();
     button->rootKey = xamlRoot ? CanonicalPtr(xamlRoot) : nullptr;
 
+    int previousFolder = button->folder;
     MatchFolder(button);
+    if (button->folder != previousFolder && !button->appId.empty()) {
+        Wh_Log(L"%s: %s", button->appId.c_str(),
+               button->folder >= 0
+                   ? (L"in folder " + FolderDisplayName(button->folder)).c_str()
+                   : L"not in a folder");
+    }
 }
 
 void ApplyButtonState(ButtonState* button, bool host, bool collapse) {
@@ -1890,6 +2318,16 @@ LRESULT CALLBACK MessageWindowProc(HWND hWnd,
         case kMsgShowClassicMenu:
             Guarded([] { ShowClassicMenuNow(); });
             return 0;
+
+        case kMsgShowFolderMenu:
+            Guarded([] {
+                ButtonState* button = FindButton(g_menuRequestKey);
+                g_menuRequestKey = nullptr;
+                if (button && button->isHost) {
+                    ShowFolderMenu(button);
+                }
+            });
+            return 0;
     }
 
     return DefWindowProcW(hWnd, uMsg, wParam, lParam);
@@ -1899,6 +2337,8 @@ void InitializeForCurrentThread() {
     if (g_hwnd) {
         return;
     }
+
+    g_uiThreadId = GetCurrentThreadId();
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -2305,6 +2745,32 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
     return hWnd;
 }
 
+// Lets a left click on a folder reach the taskbar, so that the folder can be
+// dragged, and turns the resulting launch into the folder menu. Optional: if
+// the symbols can't be found, folders work but can't be dragged.
+void HookTaskbarSymbols() {
+    HMODULE taskbarModule =
+        LoadLibraryExW(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!taskbarModule) {
+        Wh_Log(L"Couldn't load taskbar.dll");
+        return;
+    }
+
+    WindhawkUtils::SYMBOL_HOOK taskbarDllHooks[] = {
+        {
+            {LR"(public: virtual long __cdecl CTaskBand::Launch(struct ITaskGroup *,struct tagPOINT const &,enum LaunchFromTaskbarOptions))"},
+            &CTaskBand_Launch_Original,
+            CTaskBand_Launch_Hook,
+        },
+    };
+
+    g_launchHooked = WindhawkUtils::HookSymbols(
+        taskbarModule, taskbarDllHooks, ARRAYSIZE(taskbarDllHooks));
+    if (!g_launchHooked) {
+        Wh_Log(L"Couldn't hook CTaskBand::Launch, folders can't be dragged");
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Mod entry points
 
@@ -2317,6 +2783,8 @@ BOOL Wh_ModInit() {
 
     WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
                                    &CreateWindowExW_Original);
+
+    HookTaskbarSymbols();
 
     return TRUE;
 }
@@ -2353,6 +2821,9 @@ void Wh_ModSettingsChanged() {
                 g_settings = LoadSettings();
                 PruneRemovedApps();
                 g_folderIcons.clear();
+                // Re-read app details too, e.g. for an app pinned since.
+                g_appInfoCache.clear();
+                g_pinnedShortcutsLoadTime = 0;
                 UpdateAll();
             });
         },
