@@ -2,12 +2,12 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.1
+// @version         1.2
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -lole32 -loleaut32 -lruntimeobject -lshell32 -lshlwapi
+// @compilerOptions -ldwmapi -lgdi32 -lole32 -loleaut32 -lruntimeobject -lshell32 -lshlwapi
 // ==/WindhawkMod==
 
 // Source code is published under The GNU General Public License v3.0.
@@ -47,11 +47,19 @@ listed in more than one folder, the first folder wins.
 * Drag the folder to move it, like any other pinned icon. This moves the app
   the folder sits on, so the folder stays in its new spot.
 * Click ❌ next to an app to take it out of the folder and put it back on the
-  taskbar. To put it back in the folder, edit that folder's app list in the
-  mod settings: any change to a folder's app list brings back every app you
-  removed from it with ❌.
+  taskbar. This doesn't change the mod's settings: Windhawk doesn't let a mod
+  edit its own settings, so the mod remembers removed apps separately. To put
+  an app back in the folder, edit that folder's app list in the settings: any
+  change to a folder's app list brings back every app you removed from it with
+  ❌. To remove an app for good, delete it from the list in the settings.
 * An open app gets its own taskbar icon and also stays in the folder menu,
-  marked as open. Clicking it in the menu switches to it.
+  marked with how many windows it has open, for example "2 Open". Clicking it
+  in the menu switches to it. An app that's only running in the background or
+  the notification area (system tray) is marked "Open", and clicking it brings
+  up its window.
+* Some apps, such as Steam, show their windows under a separate taskbar icon
+  from their pinned one. The folder menu still lists them once, under the
+  pinned app.
 
 ## Limitations
 
@@ -115,10 +123,12 @@ Any of those values can be used in the folder's app list. Lines like
 
 #include <windows.h>
 
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
+#include <tlhelp32.h>
 #include <wincodec.h>
 #include <xamlom.h>
 
@@ -307,6 +317,8 @@ std::vector<std::unique_ptr<ButtonState>> g_buttons;
 struct AppInfo {
     std::wstring displayName;
     std::wstring exeLower;
+    // Full path of the app's program, lowercase, when known.
+    std::wstring exePathLower;
     // The app's shortcut in the taskbar's pinned items folder, if any.
     std::wstring shortcutName;
     std::wstring shortcutPath;
@@ -329,9 +341,15 @@ ULONGLONG g_pinnedShortcutsLoadTime = 0;
 struct MenuEntry {
     std::wstring appId;
     std::wstring name;
+    // Open: it has windows, or it runs in the background (e.g. in the
+    // notification area).
     bool running = false;
-    // The app's taskbar button, used to switch to it while it's open.
+    int windowCount = 0;
+    // The app's own running taskbar button, used to switch to it.
     void* buttonKey = nullptr;
+    // Running taskbar buttons of the same program under a different app ID,
+    // shown as this entry rather than separately (e.g. Steam's windows).
+    std::vector<std::wstring> aliasAppIds;
 };
 
 struct PendingClassicMenu {
@@ -819,6 +837,7 @@ const AppInfo& GetAppInfo(const std::wstring& appId) {
                 target) {
                 if (EndsWithI(target, L".exe")) {
                     info.exeLower = ToLower(FileNameOf(target));
+                    info.exePathLower = ToLower(ExpandEnvironment(target));
                 }
             }
             CoTaskMemFree(target);
@@ -830,6 +849,7 @@ const AppInfo& GetAppInfo(const std::wstring& appId) {
         info.shortcutPath = shortcut->path;
         if (info.exeLower.empty() && EndsWithI(shortcut->targetLower, L".exe")) {
             info.exeLower = FileNameOf(shortcut->targetLower);
+            info.exePathLower = shortcut->targetLower;
         }
     }
 
@@ -838,6 +858,9 @@ const AppInfo& GetAppInfo(const std::wstring& appId) {
         const std::wstring& source = path.empty() ? appId : path;
         if (EndsWithI(source, L".exe")) {
             info.exeLower = ToLower(FileNameOf(source));
+            if (source.find(L'\\') != std::wstring::npos) {
+                info.exePathLower = ToLower(source);
+            }
         }
     }
 
@@ -1318,10 +1341,221 @@ void OnIconSourceChanged(void* key, wux::DependencyObject const& sender) {
     }
 }
 
+// What's open right now: top-level windows like the ones the taskbar shows,
+// and running programs. Taken each time a folder menu opens.
+struct OpenWindow {
+    std::wstring appIdLower;   // The window's own app ID, if it sets one.
+    std::wstring exePathLower;
+};
+
+struct OpenAppsSnapshot {
+    std::vector<OpenWindow> windows;
+    std::vector<std::wstring> processPathsLower;
+};
+
+std::wstring GetProcessPathLower(DWORD processId) {
+    HANDLE process =
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process) {
+        return {};
+    }
+
+    WCHAR path[MAX_PATH * 2];
+    DWORD size = ARRAYSIZE(path);
+    std::wstring result;
+    if (QueryFullProcessImageNameW(process, 0, path, &size)) {
+        result = ToLower(std::wstring_view(path, size));
+    }
+
+    CloseHandle(process);
+    return result;
+}
+
+std::wstring GetWindowAppIdLower(HWND hWnd) {
+    winrt::com_ptr<IPropertyStore> store;
+    if (FAILED(SHGetPropertyStoreForWindow(hWnd, IID_PPV_ARGS(store.put())))) {
+        return {};
+    }
+
+    std::wstring result;
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    if (SUCCEEDED(store->GetValue(kPKEY_AppUserModel_ID, &value)) &&
+        value.vt == VT_LPWSTR && value.pwszVal) {
+        result = ToLower(value.pwszVal);
+    }
+    PropVariantClear(&value);
+    return result;
+}
+
+// Roughly the windows that get a taskbar button: visible, not cloaked (e.g. on
+// another virtual desktop), titled, and either unowned or marked as app
+// windows.
+bool IsTaskbarStyleWindow(HWND hWnd) {
+    if (!IsWindowVisible(hWnd) || GetWindowTextLengthW(hWnd) == 0) {
+        return false;
+    }
+
+    LONG_PTR exStyle = GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+    bool appWindow = exStyle & WS_EX_APPWINDOW;
+    if (!appWindow &&
+        ((exStyle & WS_EX_TOOLWINDOW) || GetWindow(hWnd, GW_OWNER))) {
+        return false;
+    }
+
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &cloaked,
+                                        sizeof(cloaked))) &&
+        cloaked) {
+        return false;
+    }
+
+    return true;
+}
+
+OpenAppsSnapshot TakeOpenAppsSnapshot() {
+    OpenAppsSnapshot snapshot;
+    std::unordered_map<DWORD, std::wstring> processPaths;
+
+    HANDLE processes = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (processes != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        if (Process32FirstW(processes, &entry)) {
+            do {
+                std::wstring path = GetProcessPathLower(entry.th32ProcessID);
+                if (!path.empty()) {
+                    processPaths[entry.th32ProcessID] = path;
+                    snapshot.processPathsLower.push_back(std::move(path));
+                }
+            } while (Process32NextW(processes, &entry));
+        }
+        CloseHandle(processes);
+    }
+
+    struct EnumParam {
+        OpenAppsSnapshot* snapshot;
+        std::unordered_map<DWORD, std::wstring>* processPaths;
+    } param{&snapshot, &processPaths};
+
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            auto* param = reinterpret_cast<EnumParam*>(lParam);
+            if (!IsTaskbarStyleWindow(hWnd)) {
+                return TRUE;
+            }
+
+            DWORD processId = 0;
+            GetWindowThreadProcessId(hWnd, &processId);
+
+            OpenWindow window;
+            window.appIdLower = GetWindowAppIdLower(hWnd);
+            auto it = param->processPaths->find(processId);
+            window.exePathLower = it != param->processPaths->end()
+                                      ? it->second
+                                      : GetProcessPathLower(processId);
+            param->snapshot->windows.push_back(std::move(window));
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&param));
+
+    return snapshot;
+}
+
+// exe is a full path when known, otherwise just a file name.
+bool IsSameProgram(const std::wstring& exeLower,
+                   const std::wstring& processPathLower) {
+    if (exeLower.empty() || processPathLower.empty()) {
+        return false;
+    }
+    if (exeLower.find(L'\\') != std::wstring::npos) {
+        return exeLower == processPathLower;
+    }
+    return exeLower == FileNameOf(processPathLower);
+}
+
+bool IsPinnedAppId(const std::wstring& appIdLower) {
+    for (const auto& shortcut : g_pinnedShortcuts) {
+        if (shortcut.appIdLower == appIdLower) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring EntryExe(const AppInfo& info) {
+    return info.exePathLower.empty() ? info.exeLower : info.exePathLower;
+}
+
+// The program behind a running button, found through its windows.
+std::wstring ExeFromWindows(const OpenAppsSnapshot& snapshot,
+                            const std::wstring& appIdLower) {
+    for (const auto& window : snapshot.windows) {
+        if (window.appIdLower == appIdLower && !window.exePathLower.empty()) {
+            return window.exePathLower;
+        }
+    }
+    return {};
+}
+
+void CountOpenWindows(MenuEntry& entry,
+                      const std::wstring& exe,
+                      const OpenAppsSnapshot& snapshot) {
+    std::wstring appIdLower = ToLower(entry.appId);
+    std::vector<std::wstring> aliasesLower;
+    for (const auto& alias : entry.aliasAppIds) {
+        aliasesLower.push_back(ToLower(alias));
+    }
+
+    // File Explorer windows belong to explorer.exe, which is also the shell
+    // itself, so they can only be told apart by app ID.
+    bool matchByProgram = !exe.empty() && FileNameOf(exe) != L"explorer.exe";
+
+    for (const auto& window : snapshot.windows) {
+        bool matches =
+            window.appIdLower == appIdLower ||
+            std::find(aliasesLower.begin(), aliasesLower.end(),
+                      window.appIdLower) != aliasesLower.end();
+
+        // A window of the same program counts too, unless it belongs to
+        // another pinned app (e.g. a pinned web app of a browser).
+        if (!matches && matchByProgram &&
+            IsSameProgram(exe, window.exePathLower) &&
+            (window.appIdLower.empty() || !IsPinnedAppId(window.appIdLower))) {
+            matches = true;
+        }
+
+        if (matches) {
+            entry.windowCount++;
+        }
+    }
+
+    bool processRunning = false;
+    if (matchByProgram) {
+        for (const auto& path : snapshot.processPathsLower) {
+            if (IsSameProgram(exe, path)) {
+                processRunning = true;
+                break;
+            }
+        }
+    }
+
+    entry.running = entry.running || entry.windowCount > 0 || processRunning;
+}
+
+std::wstring MemberDisplayName(ButtonState* member) {
+    std::wstring name = GetAppInfo(member->appId).displayName;
+    if (name.empty()) {
+        name = member->automationName;
+    }
+    if (name.empty()) {
+        name = member->appId;
+    }
+    return name;
+}
+
 std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
     std::vector<ButtonState*> members;
-    // Open apps are listed too: they have their own taskbar icon while they
-    // run, but they stay in the folder.
     for (auto& button : g_buttons) {
         if (button->folder == host->folder &&
             button->rootKey == host->rootKey && !button->appId.empty()) {
@@ -1334,30 +1568,98 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
                          return a->order < b->order;
                      });
 
+    OpenAppsSnapshot snapshot = TakeOpenAppsSnapshot();
+
     std::vector<MenuEntry> entries;
+    std::vector<std::wstring> entryExes;
     std::vector<std::wstring> seen;
+    std::vector<ButtonState*> unpinnedRunning;
+
+    // Pinned apps first: those with a pinned shortcut or a closed button.
     for (ButtonState* member : members) {
         if (std::find(seen.begin(), seen.end(), member->appIdLower) !=
             seen.end()) {
+            continue;
+        }
+
+        const AppInfo& info = GetAppInfo(member->appId);
+        if (member->running && info.shortcutPath.empty()) {
+            unpinnedRunning.push_back(member);
             continue;
         }
         seen.push_back(member->appIdLower);
 
         MenuEntry entry;
         entry.appId = member->appId;
-        entry.running = member->running;
-        entry.buttonKey = member->key;
-        entry.name = GetAppInfo(member->appId).displayName;
-        if (entry.name.empty()) {
-            entry.name = member->automationName;
-        }
-        if (entry.name.empty()) {
-            entry.name = member->appId;
+        entry.name = MemberDisplayName(member);
+        if (member->running) {
+            entry.running = true;
+            entry.buttonKey = member->key;
         }
         entries.push_back(std::move(entry));
+        entryExes.push_back(EntryExe(info));
+    }
+
+    size_t pinnedCount = entries.size();
+
+    // Running buttons without a pinned shortcut. Some apps, such as Steam, open
+    // windows under a different app ID than their pinned shortcut, which gives
+    // them a separate taskbar button. Those are shown as the pinned app.
+    for (ButtonState* member : unpinnedRunning) {
+        if (std::find(seen.begin(), seen.end(), member->appIdLower) !=
+            seen.end()) {
+            continue;
+        }
+        seen.push_back(member->appIdLower);
+
+        const AppInfo& info = GetAppInfo(member->appId);
+        std::wstring exe = EntryExe(info);
+        if (exe.empty()) {
+            exe = ExeFromWindows(snapshot, member->appIdLower);
+        }
+
+        bool merged = false;
+        if (!exe.empty() && FileNameOf(exe) != L"applicationframehost.exe") {
+            for (size_t i = 0; i < pinnedCount; i++) {
+                if (IsSameProgram(entryExes[i], exe) ||
+                    IsSameProgram(exe, entryExes[i])) {
+                    entries[i].aliasAppIds.push_back(member->appId);
+                    entries[i].running = true;
+                    if (!entries[i].buttonKey) {
+                        entries[i].buttonKey = member->key;
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+        }
+
+        if (merged) {
+            continue;
+        }
+
+        MenuEntry entry;
+        entry.appId = member->appId;
+        entry.name = MemberDisplayName(member);
+        entry.running = true;
+        entry.buttonKey = member->key;
+        entries.push_back(std::move(entry));
+        entryExes.push_back(exe);
+    }
+
+    for (size_t i = 0; i < entries.size(); i++) {
+        CountOpenWindows(entries[i], entryExes[i], snapshot);
     }
 
     return entries;
+}
+
+std::wstring OpenLabel(const MenuEntry& entry) {
+    if (entry.windowCount > 0) {
+        return std::to_wstring(entry.windowCount) + L" Open";
+    }
+    // Running without windows, e.g. only in the notification area.
+    return L"Open";
 }
 
 // Clicks the app's own taskbar button, which switches to the app (or shows its
@@ -1391,7 +1693,9 @@ bool InvokeTaskbarButton(void* buttonKey) {
 }
 
 void OpenMenuEntry(const MenuEntry& entry) {
-    if (entry.running) {
+    // An app that's open in the notification area only has no button to
+    // switch with. Launching it again brings up its window instead.
+    if (entry.buttonKey) {
         bool invoked = false;
         try {
             invoked = InvokeTaskbarButton(entry.buttonKey);
@@ -1405,6 +1709,17 @@ void OpenMenuEntry(const MenuEntry& entry) {
     }
 
     LaunchApp(entry.appId);
+}
+
+void RemoveFromFolder(int folder, const std::wstring& appId);
+
+// Also removes the entry's other app IDs, so that e.g. Steam's windows don't
+// show up in the folder on their own afterwards.
+void RemoveEntryFromFolder(int folder, const MenuEntry& entry) {
+    RemoveFromFolder(folder, entry.appId);
+    for (const auto& alias : entry.aliasAppIds) {
+        RemoveFromFolder(folder, alias);
+    }
 }
 
 void HideFolderMenu() {
@@ -1491,7 +1806,7 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
 
         if (entry.running) {
             wuxc::TextBlock openLabel;
-            openLabel.Text(L"Open");
+            openLabel.Text(winrt::hstring(OpenLabel(entry)));
             openLabel.FontSize(11);
             openLabel.Opacity(0.6);
             openLabel.VerticalAlignment(wux::VerticalAlignment::Center);
@@ -1531,10 +1846,10 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
         wux::Automation::AutomationProperties::SetName(
             removeButton,
             winrt::hstring(L"Remove " + entry.name + L" from folder"));
-        removeButton.Click([folder, appId](auto const&, auto const&) {
+        removeButton.Click([folder, entry](auto const&, auto const&) {
             Guarded([&] {
                 HideFolderMenu();
-                RemoveFromFolder(folder, appId);
+                RemoveEntryFromFolder(folder, entry);
             });
         });
 
@@ -1603,7 +1918,7 @@ void ShowClassicMenuNow() {
         UINT id = kCmdLaunchBase + static_cast<UINT>(i);
         std::wstring text = pending.entries[i].name;
         if (pending.entries[i].running) {
-            text += L"\t(open)";
+            text += L"\t" + OpenLabel(pending.entries[i]);
         }
         AppendMenuW(menu, MF_STRING, id, text.c_str());
 
@@ -1639,8 +1954,8 @@ void ShowClassicMenuNow() {
 
     size_t count = pending.entries.size();
     if (command >= kCmdRemoveBase && command < kCmdRemoveBase + count) {
-        RemoveFromFolder(pending.folder,
-                         pending.entries[command - kCmdRemoveBase].appId);
+        RemoveEntryFromFolder(pending.folder,
+                              pending.entries[command - kCmdRemoveBase]);
     } else if (command >= kCmdLaunchBase && command < kCmdLaunchBase + count) {
         OpenMenuEntry(pending.entries[command - kCmdLaunchBase]);
     }
