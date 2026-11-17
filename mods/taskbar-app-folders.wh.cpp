@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.6
+// @version         1.7
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -71,6 +71,13 @@ listed in more than one folder, the first folder wins.
   still get to ask about unsaved work. An app that's only
   running in the background or the notification area (system tray) is also
   marked "Open", and clicking it brings up its window.
+* Close also works for an app that's only running in the background, such as
+  one in the notification area, like ending it in Task Manager. The app is
+  asked to quit, and if it's still running 5 seconds later, its processes are
+  ended. Apps running as administrator can't be closed this way. If the
+  program has any window open, even on another virtual desktop, the folder
+  menu shows no Close button for it, since its processes might be shared with
+  that window (for example a browser's pinned web app).
 * Some apps, such as Steam and Chrome, can show their windows under a separate
   taskbar icon from their pinned one. The folder menu still lists them once,
   under the pinned app.
@@ -200,6 +207,11 @@ constexpr UINT kMenuIconPixels = 32;
 constexpr UINT kMsgUpdate = WM_APP + 1;
 constexpr UINT kMsgShowClassicMenu = WM_APP + 2;
 constexpr UINT kMsgShowFolderMenu = WM_APP + 3;
+
+// Background apps closed from the folder menu are asked to quit, and ended if
+// they're still running this long after.
+constexpr UINT_PTR kTimerEndBackgroundApps = 1;
+constexpr UINT kEndBackgroundAppsDelayMs = 5000;
 
 // How far the pointer can move between pressing and releasing on a folder for
 // it to still count as a click rather than a drag.
@@ -384,6 +396,9 @@ struct MenuEntry {
     int windowCount = 0;
     // The windows counted in windowCount, for closing them.
     std::vector<HWND> windows;
+    // Set when the app is open without any windows (e.g. only in the
+    // notification area): the program whose processes Close ends.
+    std::wstring backgroundExe;
     // The app's own running taskbar button, used to switch to it.
     void* buttonKey = nullptr;
     // Running taskbar buttons of the same program under a different app ID,
@@ -1473,9 +1488,19 @@ struct OpenWindow {
     std::wstring exePathLower;
 };
 
+struct RunningProcess {
+    DWORD id = 0;
+    std::wstring pathLower;
+};
+
 struct OpenAppsSnapshot {
+    // Windows the taskbar shows on the current desktop.
     std::vector<OpenWindow> windows;
-    std::vector<std::wstring> processPathsLower;
+    // Programs of windows that would get a taskbar button but are hidden from
+    // it right now, e.g. on another virtual desktop.
+    std::vector<std::wstring> cloakedWindowExesLower;
+    // Running processes in this session.
+    std::vector<RunningProcess> processes;
 };
 
 std::wstring GetProcessPathLower(DWORD processId) {
@@ -1513,10 +1538,11 @@ std::wstring GetWindowAppIdLower(HWND hWnd) {
     return result;
 }
 
-// Roughly the windows that get a taskbar button: visible, not cloaked (e.g. on
-// another virtual desktop), titled, and either unowned or marked as app
-// windows.
-bool IsTaskbarStyleWindow(HWND hWnd) {
+// Roughly the windows that get a taskbar button: visible, titled, and either
+// unowned or marked as app windows. Cloaked ones (e.g. on another virtual
+// desktop) aren't shown on the taskbar right now.
+bool IsTaskbarStyleWindow(HWND hWnd, bool* cloaked) {
+    *cloaked = false;
     if (!IsWindowVisible(hWnd) || GetWindowTextLengthW(hWnd) == 0) {
         return false;
     }
@@ -1528,14 +1554,23 @@ bool IsTaskbarStyleWindow(HWND hWnd) {
         return false;
     }
 
-    DWORD cloaked = 0;
-    if (SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &cloaked,
-                                        sizeof(cloaked))) &&
-        cloaked) {
-        return false;
-    }
-
+    DWORD cloakedValue = 0;
+    *cloaked = SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED,
+                                               &cloakedValue,
+                                               sizeof(cloakedValue))) &&
+               cloakedValue;
     return true;
+}
+
+bool IsInThisSession(DWORD processId) {
+    static DWORD sessionId = [] {
+        DWORD id = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &id);
+        return id;
+    }();
+
+    DWORD id = 0;
+    return ProcessIdToSessionId(processId, &id) && id == sessionId;
 }
 
 OpenAppsSnapshot TakeOpenAppsSnapshot() {
@@ -1548,10 +1583,14 @@ OpenAppsSnapshot TakeOpenAppsSnapshot() {
         entry.dwSize = sizeof(entry);
         if (Process32FirstW(processes, &entry)) {
             do {
-                std::wstring path = GetProcessPathLower(entry.th32ProcessID);
+                DWORD processId = entry.th32ProcessID;
+                if (!IsInThisSession(processId)) {
+                    continue;
+                }
+                std::wstring path = GetProcessPathLower(processId);
                 if (!path.empty()) {
-                    processPaths[entry.th32ProcessID] = path;
-                    snapshot.processPathsLower.push_back(std::move(path));
+                    processPaths[processId] = path;
+                    snapshot.processes.push_back({processId, std::move(path)});
                 }
             } while (Process32NextW(processes, &entry));
         }
@@ -1566,20 +1605,28 @@ OpenAppsSnapshot TakeOpenAppsSnapshot() {
     EnumWindows(
         [](HWND hWnd, LPARAM lParam) -> BOOL {
             auto* param = reinterpret_cast<EnumParam*>(lParam);
-            if (!IsTaskbarStyleWindow(hWnd)) {
+            bool cloaked;
+            if (!IsTaskbarStyleWindow(hWnd, &cloaked)) {
                 return TRUE;
             }
 
             DWORD processId = 0;
             GetWindowThreadProcessId(hWnd, &processId);
+            auto it = param->processPaths->find(processId);
+            std::wstring exePathLower = it != param->processPaths->end()
+                                            ? it->second
+                                            : GetProcessPathLower(processId);
+
+            if (cloaked) {
+                param->snapshot->cloakedWindowExesLower.push_back(
+                    std::move(exePathLower));
+                return TRUE;
+            }
 
             OpenWindow window;
             window.hWnd = hWnd;
             window.appIdLower = GetWindowAppIdLower(hWnd);
-            auto it = param->processPaths->find(processId);
-            window.exePathLower = it != param->processPaths->end()
-                                      ? it->second
-                                      : GetProcessPathLower(processId);
+            window.exePathLower = std::move(exePathLower);
             param->snapshot->windows.push_back(std::move(window));
             return TRUE;
         },
@@ -1624,6 +1671,24 @@ std::wstring ExeFromWindows(const OpenAppsSnapshot& snapshot,
     return {};
 }
 
+// Whether any of the program's windows would show on the taskbar, under any app
+// ID or virtual desktop. Then it's not just running in the background: its
+// processes may be shared with another app (e.g. a browser's pinned web app).
+bool ProgramHasWindows(const std::wstring& exe,
+                       const OpenAppsSnapshot& snapshot) {
+    for (const auto& window : snapshot.windows) {
+        if (IsSameProgram(exe, window.exePathLower)) {
+            return true;
+        }
+    }
+    for (const auto& path : snapshot.cloakedWindowExesLower) {
+        if (IsSameProgram(exe, path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void CountOpenWindows(MenuEntry& entry,
                       const std::wstring& exe,
                       const OpenAppsSnapshot& snapshot) {
@@ -1659,8 +1724,8 @@ void CountOpenWindows(MenuEntry& entry,
 
     bool processRunning = false;
     if (matchByProgram) {
-        for (const auto& path : snapshot.processPathsLower) {
-            if (IsSameProgram(exe, path)) {
+        for (const auto& process : snapshot.processes) {
+            if (IsSameProgram(exe, process.pathLower)) {
                 processRunning = true;
                 break;
             }
@@ -1668,6 +1733,13 @@ void CountOpenWindows(MenuEntry& entry,
     }
 
     entry.running = entry.running || entry.windowCount > 0 || processRunning;
+
+    // Running without a taskbar button or any window, e.g. only in the
+    // notification area, so Close has to end its processes.
+    if (processRunning && entry.windowCount == 0 && !entry.buttonKey &&
+        !ProgramHasWindows(exe, snapshot)) {
+        entry.backgroundExe = exe;
+    }
 }
 
 std::wstring MemberDisplayName(ButtonState* member) {
@@ -1882,10 +1954,117 @@ bool InvokeTaskbarButton(void* buttonKey) {
     return true;
 }
 
+// Processes of background apps that were asked to quit, to be ended when
+// kTimerEndBackgroundApps fires if they're still running.
+std::vector<HANDLE> g_endingProcesses;
+
+void ReleaseEndingProcesses() {
+    for (HANDLE process : g_endingProcesses) {
+        CloseHandle(process);
+    }
+    g_endingProcesses.clear();
+}
+
+void EndRemainingBackgroundApps() {
+    if (g_hwnd) {
+        KillTimer(g_hwnd, kTimerEndBackgroundApps);
+    }
+
+    for (HANDLE process : g_endingProcesses) {
+        if (WaitForSingleObject(process, 0) != WAIT_TIMEOUT) {
+            continue;
+        }
+        DWORD processId = GetProcessId(process);
+        if (TerminateProcess(process, 1)) {
+            Wh_Log(L"Ended process %u", processId);
+        } else {
+            Wh_Log(L"Failed to end process %u: %u", processId, GetLastError());
+        }
+    }
+
+    ReleaseEndingProcesses();
+}
+
+// Closes an app that runs without windows, e.g. only in the notification area,
+// like Task Manager's End task: each of its processes is asked to quit, the
+// way taskkill does, by posting WM_CLOSE to its top-level windows (which are
+// all hidden). Those still running a few seconds later are ended.
+void CloseBackgroundApp(const MenuEntry& entry) {
+    const std::wstring& exe = entry.backgroundExe;
+
+    // The menu may have been open for a while. Leave the app alone if it got a
+    // window since, as ending it now could lose work in that window.
+    OpenAppsSnapshot snapshot = TakeOpenAppsSnapshot();
+    if (ProgramHasWindows(exe, snapshot)) {
+        Wh_Log(L"Not closing %s: it has windows now", exe.c_str());
+        return;
+    }
+
+    std::vector<DWORD> processIds;
+    for (const auto& process : snapshot.processes) {
+        if (process.id != GetCurrentProcessId() &&
+            IsSameProgram(exe, process.pathLower)) {
+            processIds.push_back(process.id);
+        }
+    }
+
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            const auto& processIds =
+                *reinterpret_cast<std::vector<DWORD>*>(lParam);
+            DWORD processId = 0;
+            GetWindowThreadProcessId(hWnd, &processId);
+            if (std::find(processIds.begin(), processIds.end(), processId) !=
+                processIds.end()) {
+                PostMessageW(hWnd, WM_CLOSE, 0, 0);
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&processIds));
+
+    for (DWORD processId : processIds) {
+        HANDLE process = OpenProcess(
+            SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE, processId);
+        if (!process) {
+            Wh_Log(L"Can't end process %u: %u", processId, GetLastError());
+            continue;
+        }
+
+        // Make sure the ID wasn't reused for another program in the meantime.
+        WCHAR path[MAX_PATH * 2];
+        DWORD size = ARRAYSIZE(path);
+        if (!QueryFullProcessImageNameW(process, 0, path, &size) ||
+            !IsSameProgram(exe, ToLower(std::wstring_view(path, size)))) {
+            CloseHandle(process);
+            continue;
+        }
+
+        g_endingProcesses.push_back(process);
+    }
+
+    Wh_Log(L"Closing %s: asked %zu processes of %s to quit", entry.appId.c_str(),
+           processIds.size(), exe.c_str());
+
+    if (!g_endingProcesses.empty()) {
+        if (!g_hwnd || !SetTimer(g_hwnd, kTimerEndBackgroundApps,
+                                 kEndBackgroundAppsDelayMs, nullptr)) {
+            ReleaseEndingProcesses();
+        }
+    }
+}
+
 // Asks each of the app's windows to close, as the window's own close button
-// does, so apps can still ask about unsaved work. Apps running without windows
-// (e.g. only in the notification area) are left alone.
-void CloseMenuEntryWindows(const MenuEntry& entry) {
+// does, so apps can still ask about unsaved work. An app running without
+// windows is closed with CloseBackgroundApp.
+void CloseMenuEntry(const MenuEntry& entry) {
+    if (entry.windows.empty()) {
+        if (!entry.backgroundExe.empty()) {
+            CloseBackgroundApp(entry);
+        }
+        return;
+    }
+
     for (HWND hWnd : entry.windows) {
         if (IsWindow(hWnd)) {
             PostMessageW(hWnd, WM_SYSCOMMAND, SC_CLOSE, 0);
@@ -1894,6 +2073,10 @@ void CloseMenuEntryWindows(const MenuEntry& entry) {
 
     Wh_Log(L"Closed %zu windows of %s", entry.windows.size(),
            entry.appId.c_str());
+}
+
+bool CanClose(const MenuEntry& entry) {
+    return !entry.windows.empty() || !entry.backgroundExe.empty();
 }
 
 std::wstring CloseLabel(const MenuEntry& entry) {
@@ -2159,7 +2342,7 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
         row.Children().Append(openButton);
         row.Children().Append(removeButton);
 
-        if (!entry.windows.empty()) {
+        if (CanClose(entry)) {
             wuxc::TextBlock closeLabel;
             closeLabel.Text(winrt::hstring(CloseLabel(entry)));
             closeLabel.FontSize(12);
@@ -2174,6 +2357,8 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
                 entry.windowCount >= 2
                     ? L"Close all " + std::to_wstring(entry.windowCount) +
                           L" " + entry.name + L" windows"
+                : entry.windows.empty()
+                    ? L"Close " + entry.name + L", running in the background"
                     : L"Close " + entry.name;
             wuxc::ToolTipService::SetToolTip(
                 closeButton, winrt::box_value(winrt::hstring(tooltip)));
@@ -2182,7 +2367,7 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
             closeButton.Click([entry](auto const&, auto const&) {
                 Guarded([&] {
                     HideFolderMenu();
-                    CloseMenuEntryWindows(entry);
+                    CloseMenuEntry(entry);
                 });
             });
 
@@ -2386,19 +2571,19 @@ void ShowClassicMenuNow() {
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
-    bool anyWindows = false;
+    bool anyClosable = false;
     for (size_t i = 0; i < pending.entries.size(); i++) {
-        if (pending.entries[i].windows.empty()) {
+        if (!CanClose(pending.entries[i])) {
             continue;
         }
-        anyWindows = true;
+        anyClosable = true;
         std::wstring text =
             CloseLabel(pending.entries[i]) + L" " + pending.entries[i].name;
         AppendMenuW(menu, MF_STRING, kCmdCloseBase + static_cast<UINT>(i),
                     text.c_str());
     }
 
-    if (anyWindows) {
+    if (anyClosable) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
 
@@ -2433,7 +2618,7 @@ void ShowClassicMenuNow() {
     size_t count = pending.entries.size();
     size_t removedCount = pending.removed.size();
     if (command >= kCmdCloseBase && command < kCmdCloseBase + count) {
-        CloseMenuEntryWindows(pending.entries[command - kCmdCloseBase]);
+        CloseMenuEntry(pending.entries[command - kCmdCloseBase]);
     } else if (command == kCmdClearRemoved) {
         ClearRemovedList(pending.folder);
     } else if (command >= kCmdRestoreBase &&
@@ -3138,6 +3323,13 @@ LRESULT CALLBACK MessageWindowProc(HWND hWnd,
                 }
             });
             return 0;
+
+        case WM_TIMER:
+            if (wParam == kTimerEndBackgroundApps) {
+                Guarded([] { EndRemainingBackgroundApps(); });
+                return 0;
+            }
+            break;
     }
 
     return DefWindowProcW(hWnd, uMsg, wParam, lParam);
@@ -3180,6 +3372,12 @@ void UninitializeForCurrentThread() {
     g_menuFlyout = nullptr;
     g_pendingClassicMenu = PendingClassicMenu{};
     g_press = PressState{};
+
+    // Apps already asked to quit aren't ended once the mod is gone.
+    if (g_hwnd) {
+        KillTimer(g_hwnd, kTimerEndBackgroundApps);
+    }
+    ReleaseEndingProcesses();
 
     if (g_hwnd) {
         DestroyWindow(g_hwnd);
