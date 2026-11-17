@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.4
+// @version         1.5
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -333,6 +333,9 @@ struct ButtonState {
     std::wstring automationName;
     void* rootKey = nullptr;
     bool running = false;
+    // The taskbar keeps the buttons of closed windows for reuse, parked out of
+    // sight with their last app ID. Those are ignored.
+    bool recycled = false;
     int folder = -1;
     int order = 0;
 
@@ -1358,6 +1361,19 @@ ButtonState* FindButton(void* key) {
     return nullptr;
 }
 
+// Like the upstream taskbar mods, a button laid out left of or above the
+// taskbar is taken as one kept for reuse. A button the mod collapsed isn't laid
+// out at all, so its position says nothing.
+bool IsRecycled(ButtonState* button, wux::FrameworkElement const& element) {
+    if (button->collapsedByUs) {
+        return false;
+    }
+
+    auto offset = element.ActualOffset();
+    return offset.x + element.ActualWidth() < 0 ||
+           offset.y + element.ActualHeight() < 0;
+}
+
 bool IsButtonRunning(ButtonState* button) {
     auto group = button->runningGroup.get();
     if (!group) {
@@ -1660,10 +1676,18 @@ std::wstring MemberDisplayName(ButtonState* member) {
 std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
     std::vector<ButtonState*> members;
     for (auto& button : g_buttons) {
-        if (button->folder == host->folder &&
-            button->rootKey == host->rootKey && !button->appId.empty()) {
-            members.push_back(button.get());
+        if (button->folder != host->folder ||
+            button->rootKey != host->rootKey || button->appId.empty()) {
+            continue;
         }
+
+        // A button may have been put aside since the last update.
+        auto element = button->element.get();
+        if (!element || IsRecycled(button.get(), element)) {
+            continue;
+        }
+
+        members.push_back(button.get());
     }
 
     std::stable_sort(members.begin(), members.end(),
@@ -1767,8 +1791,45 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
         entryOrders.push_back(member->order);
     }
 
+    // Entries that matched the same entry of the folder's app list are the same
+    // app under different app IDs, e.g. Chrome's profile picker and its
+    // windows. Show them once.
+    for (size_t i = 0; i < entries.size(); i++) {
+        for (size_t j = i + 1; j < entries.size();) {
+            if (entryOrders[j] != entryOrders[i]) {
+                j++;
+                continue;
+            }
+
+            MenuEntry& kept = entries[i];
+            MenuEntry& extra = entries[j];
+            kept.aliasAppIds.push_back(extra.appId);
+            kept.aliasAppIds.insert(kept.aliasAppIds.end(),
+                                    extra.aliasAppIds.begin(),
+                                    extra.aliasAppIds.end());
+            kept.running = kept.running || extra.running;
+            if (!kept.buttonKey) {
+                kept.buttonKey = extra.buttonKey;
+            }
+            if (entryExes[i].empty()) {
+                entryExes[i] = entryExes[j];
+            }
+
+            entries.erase(entries.begin() + j);
+            entryExes.erase(entryExes.begin() + j);
+            entryOrders.erase(entryOrders.begin() + j);
+        }
+    }
+
     for (size_t i = 0; i < entries.size(); i++) {
         CountOpenWindows(entries[i], entryExes[i], snapshot);
+        Wh_Log(L"Menu entry %s: order %d, %s, %d windows, %zu other app IDs",
+               entries[i].appId.c_str(), entryOrders[i],
+               entries[i].running ? L"open" : L"closed",
+               entries[i].windowCount, entries[i].aliasAppIds.size());
+        for (const auto& alias : entries[i].aliasAppIds) {
+            Wh_Log(L"  also %s", alias.c_str());
+        }
     }
 
     return entries;
@@ -2858,7 +2919,13 @@ void RefreshButton(ButtonState* button) {
     button->rootKey = xamlRoot ? CanonicalPtr(xamlRoot) : nullptr;
 
     int previousFolder = button->folder;
-    MatchFolder(button);
+    button->recycled = IsRecycled(button, element);
+    if (button->recycled) {
+        button->folder = -1;
+        button->order = 0;
+    } else {
+        MatchFolder(button);
+    }
     if (button->folder != previousFolder && !button->appId.empty()) {
         Wh_Log(L"%s: %s", button->appId.c_str(),
                button->folder >= 0
