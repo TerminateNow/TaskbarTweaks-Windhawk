@@ -63,10 +63,10 @@ listed in more than one folder, the first folder wins.
   If you remove every app in a folder, the folder disappears, so its menu
   can't restore them. Change its app list in the settings to bring them back.
 * An open app gets its own taskbar icon and also stays in the folder menu,
-  marked with how many windows it has open, for example "2 Open". Clicking it
-  in the menu switches to it. An app that's only running in the background or
-  the notification area (system tray) is marked "Open", and clicking it brings
-  up its window.
+  marked "Open", or with its window count when it has more than one, for
+  example "2 Open". Clicking it in the menu switches to it. An app that's only
+  running in the background or the notification area (system tray) is also
+  marked "Open", and clicking it brings up its window.
 * Some apps, such as Steam, show their windows under a separate taskbar icon
   from their pinned one. The folder menu still lists them once, under the
   pinned app.
@@ -1733,11 +1733,12 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
     return entries;
 }
 
+// "Open" for one window, or for an app running without windows (e.g. only in
+// the notification area). The count is shown from 2 windows up: "2 Open".
 std::wstring OpenLabel(const MenuEntry& entry) {
-    if (entry.windowCount > 0) {
+    if (entry.windowCount >= 2) {
         return std::to_wstring(entry.windowCount) + L" Open";
     }
-    // Running without windows, e.g. only in the notification area.
     return L"Open";
 }
 
