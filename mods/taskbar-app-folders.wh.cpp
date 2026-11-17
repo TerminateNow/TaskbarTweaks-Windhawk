@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.7
+// @version         1.7.1
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -1496,9 +1496,9 @@ struct RunningProcess {
 struct OpenAppsSnapshot {
     // Windows the taskbar shows on the current desktop.
     std::vector<OpenWindow> windows;
-    // Programs of windows that would get a taskbar button but are hidden from
-    // it right now, e.g. on another virtual desktop.
-    std::vector<std::wstring> cloakedWindowExesLower;
+    // Windows that the taskbar shows only on another virtual desktop. Their
+    // app IDs aren't read.
+    std::vector<OpenWindow> otherDesktopWindows;
     // Running processes in this session.
     std::vector<RunningProcess> processes;
 };
@@ -1539,10 +1539,10 @@ std::wstring GetWindowAppIdLower(HWND hWnd) {
 }
 
 // Roughly the windows that get a taskbar button: visible, titled, and either
-// unowned or marked as app windows. Cloaked ones (e.g. on another virtual
-// desktop) aren't shown on the taskbar right now.
-bool IsTaskbarStyleWindow(HWND hWnd, bool* cloaked) {
-    *cloaked = false;
+// unowned or marked as app windows. Cloaked ones aren't shown on the taskbar
+// right now. cloak gets the reasons, as DWM_CLOAKED_* flags.
+bool IsTaskbarStyleWindow(HWND hWnd, DWORD* cloak) {
+    *cloak = 0;
     if (!IsWindowVisible(hWnd) || GetWindowTextLengthW(hWnd) == 0) {
         return false;
     }
@@ -1554,11 +1554,10 @@ bool IsTaskbarStyleWindow(HWND hWnd, bool* cloaked) {
         return false;
     }
 
-    DWORD cloakedValue = 0;
-    *cloaked = SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED,
-                                               &cloakedValue,
-                                               sizeof(cloakedValue))) &&
-               cloakedValue;
+    if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, cloak,
+                                     sizeof(*cloak)))) {
+        *cloak = 0;
+    }
     return true;
 }
 
@@ -1605,8 +1604,15 @@ OpenAppsSnapshot TakeOpenAppsSnapshot() {
     EnumWindows(
         [](HWND hWnd, LPARAM lParam) -> BOOL {
             auto* param = reinterpret_cast<EnumParam*>(lParam);
-            bool cloaked;
-            if (!IsTaskbarStyleWindow(hWnd, &cloaked)) {
+            DWORD cloak;
+            if (!IsTaskbarStyleWindow(hWnd, &cloak)) {
+                return TRUE;
+            }
+
+            // Cloaked only by its own app: not shown anywhere, so not really
+            // open. Chromium-based browsers keep such windows while they run
+            // in the background.
+            if (cloak && !(cloak & (DWM_CLOAKED_SHELL | DWM_CLOAKED_INHERITED))) {
                 return TRUE;
             }
 
@@ -1617,16 +1623,17 @@ OpenAppsSnapshot TakeOpenAppsSnapshot() {
                                             ? it->second
                                             : GetProcessPathLower(processId);
 
-            if (cloaked) {
-                param->snapshot->cloakedWindowExesLower.push_back(
-                    std::move(exePathLower));
+            OpenWindow window;
+            window.hWnd = hWnd;
+            window.exePathLower = std::move(exePathLower);
+            if (cloak) {
+                // Cloaked by the shell: on another virtual desktop.
+                param->snapshot->otherDesktopWindows.push_back(
+                    std::move(window));
                 return TRUE;
             }
 
-            OpenWindow window;
-            window.hWnd = hWnd;
             window.appIdLower = GetWindowAppIdLower(hWnd);
-            window.exePathLower = std::move(exePathLower);
             param->snapshot->windows.push_back(std::move(window));
             return TRUE;
         },
@@ -1671,22 +1678,31 @@ std::wstring ExeFromWindows(const OpenAppsSnapshot& snapshot,
     return {};
 }
 
-// Whether any of the program's windows would show on the taskbar, under any app
-// ID or virtual desktop. Then it's not just running in the background: its
-// processes may be shared with another app (e.g. a browser's pinned web app).
-bool ProgramHasWindows(const std::wstring& exe,
-                       const OpenAppsSnapshot& snapshot) {
-    for (const auto& window : snapshot.windows) {
-        if (IsSameProgram(exe, window.exePathLower)) {
-            return true;
+// A window of the program that the taskbar shows, under any app ID or on any
+// virtual desktop. With one, the program isn't just running in the background:
+// its processes may be shared with another app (e.g. a browser's pinned web
+// app).
+const OpenWindow* FindProgramWindow(const std::wstring& exe,
+                                    const OpenAppsSnapshot& snapshot) {
+    for (const auto* list : {&snapshot.windows, &snapshot.otherDesktopWindows}) {
+        for (const auto& window : *list) {
+            if (IsSameProgram(exe, window.exePathLower)) {
+                return &window;
+            }
         }
     }
-    for (const auto& path : snapshot.cloakedWindowExesLower) {
-        if (IsSameProgram(exe, path)) {
-            return true;
-        }
-    }
-    return false;
+    return nullptr;
+}
+
+void LogProgramWindow(const OpenWindow& window) {
+    WCHAR className[256] = L"";
+    GetClassNameW(window.hWnd, className, ARRAYSIZE(className));
+    WCHAR title[256] = L"";
+    GetWindowTextW(window.hWnd, title, ARRAYSIZE(title));
+    DWORD cloak = 0;
+    DwmGetWindowAttribute(window.hWnd, DWMWA_CLOAKED, &cloak, sizeof(cloak));
+    Wh_Log(L"  window %p: class '%s', title '%s', app ID '%s', cloak %u",
+           window.hWnd, className, title, window.appIdLower.c_str(), cloak);
 }
 
 void CountOpenWindows(MenuEntry& entry,
@@ -1736,9 +1752,20 @@ void CountOpenWindows(MenuEntry& entry,
 
     // Running without a taskbar button or any window, e.g. only in the
     // notification area, so Close has to end its processes.
-    if (processRunning && entry.windowCount == 0 && !entry.buttonKey &&
-        !ProgramHasWindows(exe, snapshot)) {
-        entry.backgroundExe = exe;
+    if (processRunning && entry.windowCount == 0) {
+        const OpenWindow* window = FindProgramWindow(exe, snapshot);
+        if (!entry.buttonKey && !window) {
+            entry.backgroundExe = exe;
+        } else {
+            Wh_Log(L"%s runs without windows of its own, but can't be closed "
+                   L"from the menu: %s",
+                   entry.appId.c_str(),
+                   entry.buttonKey ? L"it has a taskbar button"
+                                   : L"its program has another window");
+            if (window) {
+                LogProgramWindow(*window);
+            }
+        }
     }
 }
 
@@ -1995,8 +2022,9 @@ void CloseBackgroundApp(const MenuEntry& entry) {
     // The menu may have been open for a while. Leave the app alone if it got a
     // window since, as ending it now could lose work in that window.
     OpenAppsSnapshot snapshot = TakeOpenAppsSnapshot();
-    if (ProgramHasWindows(exe, snapshot)) {
+    if (const OpenWindow* window = FindProgramWindow(exe, snapshot)) {
         Wh_Log(L"Not closing %s: it has windows now", exe.c_str());
+        LogProgramWindow(*window);
         return;
     }
 
