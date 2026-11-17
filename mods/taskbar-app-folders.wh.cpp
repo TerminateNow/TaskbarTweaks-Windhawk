@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.2
+// @version         1.3
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -22,13 +22,20 @@ inside it.
 
 ## Setting up folders
 
-Folders are defined in the mod's settings. For each folder, set:
+Folders are defined in the mod's settings.
+
+If you keep your folder icons together, set **Icon folder** to that folder.
+Icons in it can then be given by file name alone, such as `games.ico`, or even
+just `games`. Full paths work too, with or without an icon folder.
+
+For each folder, set:
 
 * **Folder name**: shown at the top of the folder's menu.
-* **Folder icon**: an `.ico`, `.png`, `.jpg`, `.exe` or `.dll` file. For an
-  `.exe` or `.dll` you can pick an icon by adding its index after a comma, for
-  example `C:\Windows\System32\shell32.dll,4`. Leave it empty to use the
-  default folder icon.
+* **Folder icon**: an `.ico`, `.png`, `.jpg`, `.exe` or `.dll` file, either a
+  file name from the icon folder or a full path. For an `.exe` or `.dll` you
+  can pick an icon by adding its index after a comma, for example
+  `C:\Windows\System32\shell32.dll,4`. Leave it empty to use the default
+  folder icon.
 * **Apps**: the pinned apps that go in the folder. Each entry can be any of:
   * the app's name, as shown when you hover over its taskbar icon or in the
     Start menu, for example `Paint` or `Google Chrome`
@@ -47,11 +54,14 @@ listed in more than one folder, the first folder wins.
 * Drag the folder to move it, like any other pinned icon. This moves the app
   the folder sits on, so the folder stays in its new spot.
 * Click ❌ next to an app to take it out of the folder and put it back on the
-  taskbar. This doesn't change the mod's settings: Windhawk doesn't let a mod
-  edit its own settings, so the mod remembers removed apps separately. To put
-  an app back in the folder, edit that folder's app list in the settings: any
-  change to a folder's app list brings back every app you removed from it with
-  ❌. To remove an app for good, delete it from the list in the settings.
+  taskbar. Removed apps are listed at the bottom of the folder's menu, under
+  "Removed from this folder". Click ↩ Restore to put one back in the folder.
+* ❌ doesn't change the mod's settings: Windhawk doesn't let a mod edit its own
+  settings, so the mod remembers removed apps separately. Any change to a
+  folder's app list in the settings brings back every app removed from that
+  folder. To remove an app for good, delete it from the list in the settings.
+  If you remove every app in a folder, the folder disappears, so its menu
+  can't restore them. Change its app list in the settings to bring them back.
 * An open app gets its own taskbar icon and also stays in the folder menu,
   marked with how many windows it has open, for example "2 Open". Clicking it
   in the menu switches to it. An app that's only running in the background or
@@ -88,6 +98,18 @@ Any of those values can be used in the folder's app list. Lines like
 
 // ==WindhawkModSettings==
 /*
+- iconFolder: ""
+  $name: Icon folder
+  $description: >-
+    A folder that holds your folder icons, for example
+    C:\Users\Me\Pictures\Folder icons. Icons in it can then be given by file
+    name alone, such as games.ico, or even just games. Full paths still work
+    too.
+- defaultIcon: ""
+  $name: Default folder icon
+  $description: >-
+    Used for folders that don't have their own icon. Same format as the
+    folder icon. Leave empty to use the standard Windows folder icon.
 - folders:
   - - name: Folder 1
       $name: Folder name
@@ -95,8 +117,9 @@ Any of those values can be used in the folder's app list. Lines like
     - icon: ""
       $name: Folder icon
       $description: >-
-        Path to an .ico, .png, .jpg, .exe or .dll file. For an .exe or .dll,
-        add the icon index after a comma, for example
+        An .ico, .png, .jpg, .exe or .dll file: either a file name from the
+        icon folder (games.ico, or just games) or a full path. For an .exe or
+        .dll, add the icon index after a comma, for example
         C:\Windows\System32\shell32.dll,4. Leave empty to use the default
         folder icon.
     - apps: [""]
@@ -106,11 +129,6 @@ Any of those values can be used in the folder's app list. Lines like
         shown when you hover over its taskbar icon (for example Paint), its
         program file name (for example chrome.exe), or its AppUserModelID.
   $name: Folders
-- defaultIcon: ""
-  $name: Default folder icon
-  $description: >-
-    Used for folders that don't have their own icon. Same format as the
-    folder icon. Leave empty to use the standard Windows folder icon.
 - menuStyle: modern
   $name: Folder menu style
   $options:
@@ -185,6 +203,7 @@ constexpr int kClickMoveThreshold = 12;
 
 constexpr UINT kCmdLaunchBase = 1000;
 constexpr UINT kCmdRemoveBase = 2000;
+constexpr UINT kCmdRestoreBase = 3000;
 constexpr size_t kMaxClassicMenuEntries = 900;
 
 constexpr WCHAR kWindowClassName[] = L"WindhawkTaskbarAppFolders_" WH_MOD_ID;
@@ -248,6 +267,7 @@ struct FolderConfig {
 
 struct Settings {
     std::vector<FolderConfig> folders;
+    std::wstring iconFolder;
     std::wstring defaultIcon;
     bool classicMenu = false;
 };
@@ -255,9 +275,11 @@ struct Settings {
 Settings g_settings;
 
 // Apps removed from a folder with the ❌ button, keyed by FolderConfig::key.
+// Each removal is a group of app IDs: the app's own, then those of its other
+// taskbar buttons (e.g. Steam's windows), so they're restored together.
 struct RemovedApps {
     std::wstring signature;
-    std::vector<std::wstring> appIds;  // Lowercase.
+    std::vector<std::vector<std::wstring>> groups;
 };
 
 std::unordered_map<std::wstring, RemovedApps> g_removedApps;
@@ -352,9 +374,16 @@ struct MenuEntry {
     std::vector<std::wstring> aliasAppIds;
 };
 
+// An app removed from a folder with ❌, which the folder menu can restore.
+struct RemovedEntry {
+    std::wstring appId;
+    std::wstring name;
+};
+
 struct PendingClassicMenu {
     int folder = -1;
     std::vector<MenuEntry> entries;
+    std::vector<RemovedEntry> removed;
     POINT pt{};
 };
 
@@ -553,6 +582,7 @@ Settings LoadSettings() {
         settings.folders.push_back(std::move(folder));
     }
 
+    settings.iconFolder = StripQuotes(GetStringSetting(L"iconFolder"));
     settings.defaultIcon = Trim(GetStringSetting(L"defaultIcon"));
     settings.classicMenu = GetStringSetting(L"menuStyle") == L"classic";
 
@@ -575,8 +605,8 @@ std::vector<std::wstring> Split(std::wstring_view s, WCHAR separator) {
     return parts;
 }
 
-// Stored as one line per folder: key, signature, then the removed app IDs, all
-// separated by tabs.
+// Stored as one line per folder: key, signature, then the removals, all
+// separated by tabs. A removal's app IDs are separated by '|'.
 void LoadRemovedApps() {
     g_removedApps.clear();
 
@@ -592,12 +622,18 @@ void LoadRemovedApps() {
         RemovedApps removed;
         removed.signature = fields[1];
         for (size_t i = 2; i < fields.size(); i++) {
-            if (!fields[i].empty()) {
-                removed.appIds.push_back(fields[i]);
+            std::vector<std::wstring> group;
+            for (auto& appId : Split(fields[i], L'|')) {
+                if (!appId.empty()) {
+                    group.push_back(std::move(appId));
+                }
+            }
+            if (!group.empty()) {
+                removed.groups.push_back(std::move(group));
             }
         }
 
-        if (!removed.appIds.empty()) {
+        if (!removed.groups.empty()) {
             g_removedApps[fields[0]] = std::move(removed);
         }
     }
@@ -606,15 +642,20 @@ void LoadRemovedApps() {
 void SaveRemovedApps() {
     std::wstring data;
     for (const auto& [key, removed] : g_removedApps) {
-        if (removed.appIds.empty()) {
+        if (removed.groups.empty()) {
             continue;
         }
         data += key;
         data += L'\t';
         data += removed.signature;
-        for (const auto& appId : removed.appIds) {
+        for (const auto& group : removed.groups) {
             data += L'\t';
-            data += appId;
+            for (size_t i = 0; i < group.size(); i++) {
+                if (i > 0) {
+                    data += L'|';
+                }
+                data += group[i];
+            }
         }
         data += L'\n';
     }
@@ -656,8 +697,14 @@ bool IsRemovedFromFolder(const FolderConfig& folder,
         return false;
     }
 
-    const auto& appIds = it->second.appIds;
-    return std::find(appIds.begin(), appIds.end(), appIdLower) != appIds.end();
+    for (const auto& group : it->second.groups) {
+        for (const auto& appId : group) {
+            if (ToLower(appId) == appIdLower) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1021,6 +1068,38 @@ HICON ExtractIconAtSize(const std::wstring& path, int index, UINT size) {
     return nullptr;
 }
 
+// A relative icon path is looked up in the icon folder from the settings. A
+// name without an extension tries the common icon and image extensions.
+std::wstring ResolveIconPath(const std::wstring& path) {
+    if (path.empty() || !PathIsRelativeW(path.c_str()) ||
+        g_settings.iconFolder.empty()) {
+        return path;
+    }
+
+    std::wstring folder = ExpandEnvironment(g_settings.iconFolder);
+    while (!folder.empty() && (folder.back() == L'\\' || folder.back() == L'/')) {
+        folder.pop_back();
+    }
+
+    std::wstring fullPath = folder + L'\\' + path;
+    if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return fullPath;
+    }
+
+    if (*PathFindExtensionW(path.c_str()) == L'\0') {
+        for (PCWSTR extension : {L".ico", L".png", L".jpg", L".jpeg", L".bmp",
+                                 L".gif", L".tif", L".tiff"}) {
+            std::wstring candidate = fullPath + extension;
+            if (GetFileAttributesW(candidate.c_str()) !=
+                INVALID_FILE_ATTRIBUTES) {
+                return candidate;
+            }
+        }
+    }
+
+    return fullPath;
+}
+
 // spec: empty for the standard folder icon, an image file, or an .exe/.dll/.ico
 // path optionally followed by ",index".
 bool LoadIconSpecPixels(const std::wstring& spec,
@@ -1055,7 +1134,7 @@ bool LoadIconSpecPixels(const std::wstring& spec,
                 path = StripQuotes(std::wstring_view(trimmed).substr(0, comma));
             }
         }
-        path = ExpandEnvironment(path);
+        path = ResolveIconPath(ExpandEnvironment(path));
     }
 
     auto wic = CreateWicFactory();
@@ -1711,17 +1790,6 @@ void OpenMenuEntry(const MenuEntry& entry) {
     LaunchApp(entry.appId);
 }
 
-void RemoveFromFolder(int folder, const std::wstring& appId);
-
-// Also removes the entry's other app IDs, so that e.g. Steam's windows don't
-// show up in the folder on their own afterwards.
-void RemoveEntryFromFolder(int folder, const MenuEntry& entry) {
-    RemoveFromFolder(folder, entry.appId);
-    for (const auto& alias : entry.aliasAppIds) {
-        RemoveFromFolder(folder, alias);
-    }
-}
-
 void HideFolderMenu() {
     if (g_menuFlyout) {
         auto flyout = g_menuFlyout;
@@ -1730,7 +1798,10 @@ void HideFolderMenu() {
     }
 }
 
-void RemoveFromFolder(int folder, const std::wstring& appId) {
+// Takes a folder menu entry out of its folder, together with its other app IDs
+// (e.g. Steam's windows), so that those don't show up in the folder on their
+// own afterwards.
+void RemoveEntryFromFolder(int folder, const MenuEntry& entry) {
     if (folder < 0 || folder >= static_cast<int>(g_settings.folders.size())) {
         return;
     }
@@ -1739,16 +1810,85 @@ void RemoveFromFolder(int folder, const std::wstring& appId) {
     auto& removed = g_removedApps[config.key];
     if (removed.signature != config.signature) {
         removed.signature = config.signature;
-        removed.appIds.clear();
+        removed.groups.clear();
+    }
+
+    if (IsRemovedFromFolder(config, ToLower(entry.appId))) {
+        return;
+    }
+
+    std::vector<std::wstring> group{entry.appId};
+    group.insert(group.end(), entry.aliasAppIds.begin(),
+                 entry.aliasAppIds.end());
+    removed.groups.push_back(std::move(group));
+
+    Wh_Log(L"Removed %s from folder %s", entry.appId.c_str(),
+           config.name.c_str());
+
+    SaveRemovedApps();
+    ScheduleUpdate();
+}
+
+// The apps removed from a folder with ❌, which its menu offers to restore.
+std::vector<RemovedEntry> GetRemovedEntries(int folder) {
+    std::vector<RemovedEntry> result;
+    if (folder < 0 || folder >= static_cast<int>(g_settings.folders.size())) {
+        return result;
+    }
+
+    const auto& config = g_settings.folders[folder];
+    auto it = g_removedApps.find(config.key);
+    if (it == g_removedApps.end() ||
+        it->second.signature != config.signature) {
+        return result;
+    }
+
+    for (const auto& group : it->second.groups) {
+        RemovedEntry entry;
+        entry.appId = group.front();
+        entry.name = GetAppInfo(entry.appId).displayName;
+        if (entry.name.empty()) {
+            std::wstring appIdLower = ToLower(entry.appId);
+            for (const auto& button : g_buttons) {
+                if (button->appIdLower == appIdLower &&
+                    !button->automationName.empty()) {
+                    entry.name = button->automationName;
+                    break;
+                }
+            }
+        }
+        if (entry.name.empty()) {
+            entry.name = entry.appId;
+        }
+        result.push_back(std::move(entry));
+    }
+
+    return result;
+}
+
+void RestoreToFolder(int folder, const std::wstring& appId) {
+    if (folder < 0 || folder >= static_cast<int>(g_settings.folders.size())) {
+        return;
+    }
+
+    const auto& config = g_settings.folders[folder];
+    auto it = g_removedApps.find(config.key);
+    if (it == g_removedApps.end()) {
+        return;
     }
 
     std::wstring appIdLower = ToLower(appId);
-    if (std::find(removed.appIds.begin(), removed.appIds.end(), appIdLower) ==
-        removed.appIds.end()) {
-        removed.appIds.push_back(appIdLower);
+    auto& groups = it->second.groups;
+    groups.erase(std::remove_if(groups.begin(), groups.end(),
+                                [&](const std::vector<std::wstring>& group) {
+                                    return ToLower(group.front()) == appIdLower;
+                                }),
+                 groups.end());
+    if (groups.empty()) {
+        g_removedApps.erase(it);
     }
 
-    Wh_Log(L"Removed %s from folder %s", appId.c_str(), config.name.c_str());
+    Wh_Log(L"Restored %s to folder %s", appId.c_str(), config.name.c_str());
 
     SaveRemovedApps();
     ScheduleUpdate();
@@ -1760,7 +1900,8 @@ wux::Media::SolidColorBrush TransparentBrush() {
 
 void ShowModernMenu(wux::FrameworkElement const& anchor,
                     int folder,
-                    const std::vector<MenuEntry>& entries) {
+                    const std::vector<MenuEntry>& entries,
+                    const std::vector<RemovedEntry>& removed) {
     HideFolderMenu();
 
     wuxc::StackPanel panel;
@@ -1859,6 +2000,82 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
         panel.Children().Append(row);
     }
 
+    if (!removed.empty()) {
+        wuxc::Border separator;
+        separator.Height(1);
+        separator.Margin(wux::Thickness{8, 6, 8, 6});
+        separator.Background(wux::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{0x40, 0x80, 0x80, 0x80}));
+        panel.Children().Append(separator);
+
+        wuxc::TextBlock caption;
+        caption.Text(L"Removed from this folder");
+        caption.FontSize(12);
+        caption.Opacity(0.6);
+        caption.Margin(wux::Thickness{8, 0, 8, 4});
+        panel.Children().Append(caption);
+    }
+
+    for (const auto& entry : removed) {
+        std::wstring appId = entry.appId;
+
+        wuxc::Grid row;
+        wuxc::ColumnDefinition nameColumn;
+        nameColumn.Width(wux::GridLength{1, wux::GridUnitType::Star});
+        wuxc::ColumnDefinition restoreColumn;
+        restoreColumn.Width(wux::GridLength{1, wux::GridUnitType::Auto});
+        row.ColumnDefinitions().Append(nameColumn);
+        row.ColumnDefinitions().Append(restoreColumn);
+
+        wuxc::StackPanel content;
+        content.Orientation(wuxc::Orientation::Horizontal);
+        content.Spacing(10);
+        content.Margin(wux::Thickness{8, 6, 8, 6});
+        content.Opacity(0.6);
+
+        if (auto icon = GetAppIcon(appId)) {
+            wuxc::Image image;
+            image.Source(icon);
+            image.Width(20);
+            image.Height(20);
+            content.Children().Append(image);
+        }
+
+        wuxc::TextBlock label;
+        label.Text(winrt::hstring(entry.name));
+        label.VerticalAlignment(wux::VerticalAlignment::Center);
+        label.TextTrimming(wux::TextTrimming::CharacterEllipsis);
+        content.Children().Append(label);
+
+        wuxc::TextBlock restoreLabel;
+        restoreLabel.Text(L"\u21A9 Restore");
+        restoreLabel.FontSize(12);
+
+        wuxc::Button restoreButton;
+        restoreButton.Content(restoreLabel);
+        restoreButton.VerticalAlignment(wux::VerticalAlignment::Center);
+        restoreButton.Background(TransparentBrush());
+        restoreButton.BorderThickness(wux::Thickness{0, 0, 0, 0});
+        restoreButton.Padding(wux::Thickness{8, 6, 8, 6});
+        wuxc::ToolTipService::SetToolTip(
+            restoreButton,
+            winrt::box_value(winrt::hstring(L"Put back in this folder")));
+        wux::Automation::AutomationProperties::SetName(
+            restoreButton,
+            winrt::hstring(L"Restore " + entry.name + L" to folder"));
+        restoreButton.Click([folder, appId](auto const&, auto const&) {
+            Guarded([&] {
+                HideFolderMenu();
+                RestoreToFolder(folder, appId);
+            });
+        });
+
+        wuxc::Grid::SetColumn(restoreButton, 1);
+        row.Children().Append(content);
+        row.Children().Append(restoreButton);
+        panel.Children().Append(row);
+    }
+
     wuxc::Flyout flyout;
     flyout.Content(panel);
     // The taskbar's XAML island is only as tall as the taskbar, the menu has to
@@ -1877,13 +2094,16 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
     flyout.ShowAt(anchor, options);
 }
 
-void QueueClassicMenu(int folder, std::vector<MenuEntry> entries) {
+void QueueClassicMenu(int folder,
+                      std::vector<MenuEntry> entries,
+                      std::vector<RemovedEntry> removed) {
     if (!g_hwnd) {
         return;
     }
 
     g_pendingClassicMenu.folder = folder;
     g_pendingClassicMenu.entries = std::move(entries);
+    g_pendingClassicMenu.removed = std::move(removed);
     GetCursorPos(&g_pendingClassicMenu.pt);
 
     // Run the menu's modal loop outside of the XAML input handler.
@@ -1900,6 +2120,9 @@ void ShowClassicMenuNow() {
 
     if (pending.entries.size() > kMaxClassicMenuEntries) {
         pending.entries.resize(kMaxClassicMenuEntries);
+    }
+    if (pending.removed.size() > kMaxClassicMenuEntries) {
+        pending.removed.resize(kMaxClassicMenuEntries);
     }
 
     HMENU menu = CreatePopupMenu();
@@ -1941,6 +2164,15 @@ void ShowClassicMenuNow() {
                     text.c_str());
     }
 
+    if (!pending.removed.empty()) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        for (size_t i = 0; i < pending.removed.size(); i++) {
+            std::wstring text = L"\u21A9  Restore " + pending.removed[i].name;
+            AppendMenuW(menu, MF_STRING,
+                        kCmdRestoreBase + static_cast<UINT>(i), text.c_str());
+        }
+    }
+
     SetForegroundWindow(g_hwnd);
     UINT command = static_cast<UINT>(TrackPopupMenuEx(
         menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pending.pt.x,
@@ -1953,7 +2185,11 @@ void ShowClassicMenuNow() {
     }
 
     size_t count = pending.entries.size();
-    if (command >= kCmdRemoveBase && command < kCmdRemoveBase + count) {
+    size_t removedCount = pending.removed.size();
+    if (command >= kCmdRestoreBase && command < kCmdRestoreBase + removedCount) {
+        RestoreToFolder(pending.folder,
+                        pending.removed[command - kCmdRestoreBase].appId);
+    } else if (command >= kCmdRemoveBase && command < kCmdRemoveBase + count) {
         RemoveEntryFromFolder(pending.folder,
                               pending.entries[command - kCmdRemoveBase]);
     } else if (command >= kCmdLaunchBase && command < kCmdLaunchBase + count) {
@@ -1972,18 +2208,20 @@ void ShowFolderMenu(ButtonState* host) {
         return;
     }
 
+    auto removed = GetRemovedEntries(host->folder);
+
     if (g_settings.classicMenu) {
-        QueueClassicMenu(host->folder, std::move(entries));
+        QueueClassicMenu(host->folder, std::move(entries), std::move(removed));
         return;
     }
 
     try {
-        ShowModernMenu(element, host->folder, entries);
+        ShowModernMenu(element, host->folder, entries, removed);
     } catch (...) {
         Wh_Log(L"Modern menu failed (%08X), using the classic menu",
                winrt::to_hresult());
         g_menuFlyout = nullptr;
-        QueueClassicMenu(host->folder, std::move(entries));
+        QueueClassicMenu(host->folder, std::move(entries), std::move(removed));
     }
 }
 
