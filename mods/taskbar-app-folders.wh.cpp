@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.5
+// @version         1.6
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -66,7 +66,9 @@ listed in more than one folder, the first folder wins.
   can't restore them. Change its app list in the settings to bring them back.
 * An open app gets its own taskbar icon and also stays in the folder menu,
   marked "Open", or with its window count when it has more than one, for
-  example "Open | 2". Clicking it in the menu switches to it. An app that's only
+  example "Open | 2". Clicking it in the menu switches to it, and its Close
+  button (Close all, with more than one window) closes its windows. Apps
+  still get to ask about unsaved work. An app that's only
   running in the background or the notification area (system tray) is also
   marked "Open", and clicking it brings up its window.
 * Some apps, such as Steam and Chrome, can show their windows under a separate
@@ -207,6 +209,7 @@ constexpr UINT kCmdLaunchBase = 1000;
 constexpr UINT kCmdRemoveBase = 2000;
 constexpr UINT kCmdRestoreBase = 3000;
 constexpr UINT kCmdClearRemoved = 4000;
+constexpr UINT kCmdCloseBase = 5000;
 constexpr size_t kMaxClassicMenuEntries = 900;
 
 constexpr WCHAR kWindowClassName[] = L"WindhawkTaskbarAppFolders_" WH_MOD_ID;
@@ -379,6 +382,8 @@ struct MenuEntry {
     // notification area).
     bool running = false;
     int windowCount = 0;
+    // The windows counted in windowCount, for closing them.
+    std::vector<HWND> windows;
     // The app's own running taskbar button, used to switch to it.
     void* buttonKey = nullptr;
     // Running taskbar buttons of the same program under a different app ID,
@@ -1463,6 +1468,7 @@ void OnIconSourceChanged(void* key, wux::DependencyObject const& sender) {
 // What's open right now: top-level windows like the ones the taskbar shows,
 // and running programs. Taken each time a folder menu opens.
 struct OpenWindow {
+    HWND hWnd = nullptr;
     std::wstring appIdLower;   // The window's own app ID, if it sets one.
     std::wstring exePathLower;
 };
@@ -1568,6 +1574,7 @@ OpenAppsSnapshot TakeOpenAppsSnapshot() {
             GetWindowThreadProcessId(hWnd, &processId);
 
             OpenWindow window;
+            window.hWnd = hWnd;
             window.appIdLower = GetWindowAppIdLower(hWnd);
             auto it = param->processPaths->find(processId);
             window.exePathLower = it != param->processPaths->end()
@@ -1646,6 +1653,7 @@ void CountOpenWindows(MenuEntry& entry,
 
         if (matches) {
             entry.windowCount++;
+            entry.windows.push_back(window.hWnd);
         }
     }
 
@@ -1874,6 +1882,24 @@ bool InvokeTaskbarButton(void* buttonKey) {
     return true;
 }
 
+// Asks each of the app's windows to close, as the window's own close button
+// does, so apps can still ask about unsaved work. Apps running without windows
+// (e.g. only in the notification area) are left alone.
+void CloseMenuEntryWindows(const MenuEntry& entry) {
+    for (HWND hWnd : entry.windows) {
+        if (IsWindow(hWnd)) {
+            PostMessageW(hWnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+        }
+    }
+
+    Wh_Log(L"Closed %zu windows of %s", entry.windows.size(),
+           entry.appId.c_str());
+}
+
+std::wstring CloseLabel(const MenuEntry& entry) {
+    return entry.windowCount >= 2 ? L"Close all" : L"Close";
+}
+
 void OpenMenuEntry(const MenuEntry& entry) {
     // An app that's open in the notification area only has no button to
     // switch with. Launching it again brings up its window instead.
@@ -2054,9 +2080,12 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
         wuxc::Grid row;
         wuxc::ColumnDefinition nameColumn;
         nameColumn.Width(wux::GridLength{1, wux::GridUnitType::Star});
+        wuxc::ColumnDefinition closeColumn;
+        closeColumn.Width(wux::GridLength{1, wux::GridUnitType::Auto});
         wuxc::ColumnDefinition removeColumn;
         removeColumn.Width(wux::GridLength{1, wux::GridUnitType::Auto});
         row.ColumnDefinitions().Append(nameColumn);
+        row.ColumnDefinitions().Append(closeColumn);
         row.ColumnDefinitions().Append(removeColumn);
 
         wuxc::StackPanel content;
@@ -2126,9 +2155,41 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
             });
         });
 
-        wuxc::Grid::SetColumn(removeButton, 1);
+        wuxc::Grid::SetColumn(removeButton, 2);
         row.Children().Append(openButton);
         row.Children().Append(removeButton);
+
+        if (!entry.windows.empty()) {
+            wuxc::TextBlock closeLabel;
+            closeLabel.Text(winrt::hstring(CloseLabel(entry)));
+            closeLabel.FontSize(12);
+
+            wuxc::Button closeButton;
+            closeButton.Content(closeLabel);
+            closeButton.VerticalAlignment(wux::VerticalAlignment::Stretch);
+            closeButton.Background(TransparentBrush());
+            closeButton.BorderThickness(wux::Thickness{0, 0, 0, 0});
+            closeButton.Padding(wux::Thickness{8, 6, 8, 6});
+            std::wstring tooltip =
+                entry.windowCount >= 2
+                    ? L"Close all " + std::to_wstring(entry.windowCount) +
+                          L" " + entry.name + L" windows"
+                    : L"Close " + entry.name;
+            wuxc::ToolTipService::SetToolTip(
+                closeButton, winrt::box_value(winrt::hstring(tooltip)));
+            wux::Automation::AutomationProperties::SetName(
+                closeButton, winrt::hstring(tooltip));
+            closeButton.Click([entry](auto const&, auto const&) {
+                Guarded([&] {
+                    HideFolderMenu();
+                    CloseMenuEntryWindows(entry);
+                });
+            });
+
+            wuxc::Grid::SetColumn(closeButton, 1);
+            row.Children().Append(closeButton);
+        }
+
         panel.Children().Append(row);
     }
 
@@ -2325,6 +2386,22 @@ void ShowClassicMenuNow() {
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
+    bool anyWindows = false;
+    for (size_t i = 0; i < pending.entries.size(); i++) {
+        if (pending.entries[i].windows.empty()) {
+            continue;
+        }
+        anyWindows = true;
+        std::wstring text =
+            CloseLabel(pending.entries[i]) + L" " + pending.entries[i].name;
+        AppendMenuW(menu, MF_STRING, kCmdCloseBase + static_cast<UINT>(i),
+                    text.c_str());
+    }
+
+    if (anyWindows) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+
     for (size_t i = 0; i < pending.entries.size(); i++) {
         std::wstring text = L"\u274C  Remove " + pending.entries[i].name;
         AppendMenuW(menu, MF_STRING, kCmdRemoveBase + static_cast<UINT>(i),
@@ -2355,7 +2432,9 @@ void ShowClassicMenuNow() {
 
     size_t count = pending.entries.size();
     size_t removedCount = pending.removed.size();
-    if (command == kCmdClearRemoved) {
+    if (command >= kCmdCloseBase && command < kCmdCloseBase + count) {
+        CloseMenuEntryWindows(pending.entries[command - kCmdCloseBase]);
+    } else if (command == kCmdClearRemoved) {
         ClearRemovedList(pending.folder);
     } else if (command >= kCmdRestoreBase &&
                command < kCmdRestoreBase + removedCount) {
