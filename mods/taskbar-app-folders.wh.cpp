@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.3
+// @version         1.4
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -55,11 +55,13 @@ listed in more than one folder, the first folder wins.
   the folder sits on, so the folder stays in its new spot.
 * Click ❌ next to an app to take it out of the folder and put it back on the
   taskbar. Removed apps are listed at the bottom of the folder's menu, under
-  "Removed from this folder". Click ↩ Restore to put one back in the folder.
+  "Removed from this folder". Click ↩ Restore to put one back in the folder,
+  or Clear to empty the list. Cleared apps stay out of the folder.
 * ❌ doesn't change the mod's settings: Windhawk doesn't let a mod edit its own
   settings, so the mod remembers removed apps separately. Any change to a
   folder's app list in the settings brings back every app removed from that
-  folder. To remove an app for good, delete it from the list in the settings.
+  folder, including cleared ones. To remove an app for good, delete it from
+  the list in the settings.
   If you remove every app in a folder, the folder disappears, so its menu
   can't restore them. Change its app list in the settings to bring them back.
 * An open app gets its own taskbar icon and also stays in the folder menu,
@@ -67,9 +69,9 @@ listed in more than one folder, the first folder wins.
   example "Open | 2". Clicking it in the menu switches to it. An app that's only
   running in the background or the notification area (system tray) is also
   marked "Open", and clicking it brings up its window.
-* Some apps, such as Steam, show their windows under a separate taskbar icon
-  from their pinned one. The folder menu still lists them once, under the
-  pinned app.
+* Some apps, such as Steam and Chrome, can show their windows under a separate
+  taskbar icon from their pinned one. The folder menu still lists them once,
+  under the pinned app.
 
 ## Limitations
 
@@ -204,6 +206,7 @@ constexpr int kClickMoveThreshold = 12;
 constexpr UINT kCmdLaunchBase = 1000;
 constexpr UINT kCmdRemoveBase = 2000;
 constexpr UINT kCmdRestoreBase = 3000;
+constexpr UINT kCmdClearRemoved = 4000;
 constexpr size_t kMaxClassicMenuEntries = 900;
 
 constexpr WCHAR kWindowClassName[] = L"WindhawkTaskbarAppFolders_" WH_MOD_ID;
@@ -276,10 +279,16 @@ Settings g_settings;
 
 // Apps removed from a folder with the ❌ button, keyed by FolderConfig::key.
 // Each removal is a group of app IDs: the app's own, then those of its other
-// taskbar buttons (e.g. Steam's windows), so they're restored together.
+// taskbar buttons (e.g. Steam's windows), so they're restored together. A
+// cleared removal stays out of the folder but isn't offered for restoring.
+struct RemovedGroup {
+    std::vector<std::wstring> appIds;
+    bool cleared = false;
+};
+
 struct RemovedApps {
     std::wstring signature;
-    std::vector<std::vector<std::wstring>> groups;
+    std::vector<RemovedGroup> groups;
 };
 
 std::unordered_map<std::wstring, RemovedApps> g_removedApps;
@@ -510,6 +519,12 @@ std::wstring GetStringSetting(PCWSTR name, Args... args) {
     return result;
 }
 
+// A running button's accessible name can have details after the app's name,
+// e.g. "Google Chrome - 1 running window".
+std::wstring ShortAutomationName(const std::wstring& name) {
+    return Trim(std::wstring_view(name).substr(0, name.find(L" - ")));
+}
+
 void* CanonicalPtr(wf::IInspectable const& object) {
     return winrt::get_abi(object.as<wf::IUnknown>());
 }
@@ -606,7 +621,8 @@ std::vector<std::wstring> Split(std::wstring_view s, WCHAR separator) {
 }
 
 // Stored as one line per folder: key, signature, then the removals, all
-// separated by tabs. A removal's app IDs are separated by '|'.
+// separated by tabs. A removal's app IDs are separated by '|', and a cleared
+// removal starts with '~'.
 void LoadRemovedApps() {
     g_removedApps.clear();
 
@@ -622,13 +638,18 @@ void LoadRemovedApps() {
         RemovedApps removed;
         removed.signature = fields[1];
         for (size_t i = 2; i < fields.size(); i++) {
-            std::vector<std::wstring> group;
-            for (auto& appId : Split(fields[i], L'|')) {
+            RemovedGroup group;
+            std::wstring_view field = fields[i];
+            if (!field.empty() && field.front() == L'~') {
+                group.cleared = true;
+                field.remove_prefix(1);
+            }
+            for (auto& appId : Split(field, L'|')) {
                 if (!appId.empty()) {
-                    group.push_back(std::move(appId));
+                    group.appIds.push_back(std::move(appId));
                 }
             }
-            if (!group.empty()) {
+            if (!group.appIds.empty()) {
                 removed.groups.push_back(std::move(group));
             }
         }
@@ -650,11 +671,14 @@ void SaveRemovedApps() {
         data += removed.signature;
         for (const auto& group : removed.groups) {
             data += L'\t';
-            for (size_t i = 0; i < group.size(); i++) {
+            if (group.cleared) {
+                data += L'~';
+            }
+            for (size_t i = 0; i < group.appIds.size(); i++) {
                 if (i > 0) {
                     data += L'|';
                 }
-                data += group[i];
+                data += group.appIds[i];
             }
         }
         data += L'\n';
@@ -698,7 +722,7 @@ bool IsRemovedFromFolder(const FolderConfig& folder,
     }
 
     for (const auto& group : it->second.groups) {
-        for (const auto& appId : group) {
+        for (const auto& appId : group.appIds) {
             if (ToLower(appId) == appIdLower) {
                 return true;
             }
@@ -1625,7 +1649,7 @@ void CountOpenWindows(MenuEntry& entry,
 std::wstring MemberDisplayName(ButtonState* member) {
     std::wstring name = GetAppInfo(member->appId).displayName;
     if (name.empty()) {
-        name = member->automationName;
+        name = ShortAutomationName(member->automationName);
     }
     if (name.empty()) {
         name = member->appId;
@@ -1651,6 +1675,8 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
 
     std::vector<MenuEntry> entries;
     std::vector<std::wstring> entryExes;
+    // The position in the folder's app list that each entry matched.
+    std::vector<int> entryOrders;
     std::vector<std::wstring> seen;
     std::vector<ButtonState*> unpinnedRunning;
 
@@ -1677,13 +1703,18 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
         }
         entries.push_back(std::move(entry));
         entryExes.push_back(EntryExe(info));
+        entryOrders.push_back(member->order);
     }
 
     size_t pinnedCount = entries.size();
 
-    // Running buttons without a pinned shortcut. Some apps, such as Steam, open
-    // windows under a different app ID than their pinned shortcut, which gives
-    // them a separate taskbar button. Those are shown as the pinned app.
+    // Running buttons without a pinned shortcut. Some apps, such as Steam and
+    // Chrome, open windows under a different app ID than their pinned
+    // shortcut, which gives them a separate taskbar button. Those are shown as
+    // the pinned app: the one that matched the same entry in the folder's app
+    // list, or else the one with the same program. Matching by the entry comes
+    // first since the program can't always be found: Chrome sets its app ID
+    // for the whole process, not on its windows.
     for (ButtonState* member : unpinnedRunning) {
         if (std::find(seen.begin(), seen.end(), member->appIdLower) !=
             seen.end()) {
@@ -1697,23 +1728,32 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
             exe = ExeFromWindows(snapshot, member->appIdLower);
         }
 
-        bool merged = false;
-        if (!exe.empty() && FileNameOf(exe) != L"applicationframehost.exe") {
+        std::optional<size_t> target;
+        for (size_t i = 0; i < pinnedCount; i++) {
+            if (entryOrders[i] == member->order) {
+                target = i;
+                break;
+            }
+        }
+
+        if (!target && !exe.empty() &&
+            FileNameOf(exe) != L"applicationframehost.exe") {
             for (size_t i = 0; i < pinnedCount; i++) {
                 if (IsSameProgram(entryExes[i], exe) ||
                     IsSameProgram(exe, entryExes[i])) {
-                    entries[i].aliasAppIds.push_back(member->appId);
-                    entries[i].running = true;
-                    if (!entries[i].buttonKey) {
-                        entries[i].buttonKey = member->key;
-                    }
-                    merged = true;
+                    target = i;
                     break;
                 }
             }
         }
 
-        if (merged) {
+        if (target) {
+            auto& entry = entries[*target];
+            entry.aliasAppIds.push_back(member->appId);
+            entry.running = true;
+            if (!entry.buttonKey) {
+                entry.buttonKey = member->key;
+            }
             continue;
         }
 
@@ -1724,6 +1764,7 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
         entry.buttonKey = member->key;
         entries.push_back(std::move(entry));
         entryExes.push_back(exe);
+        entryOrders.push_back(member->order);
     }
 
     for (size_t i = 0; i < entries.size(); i++) {
@@ -1818,9 +1859,10 @@ void RemoveEntryFromFolder(int folder, const MenuEntry& entry) {
         return;
     }
 
-    std::vector<std::wstring> group{entry.appId};
-    group.insert(group.end(), entry.aliasAppIds.begin(),
-                 entry.aliasAppIds.end());
+    RemovedGroup group;
+    group.appIds.push_back(entry.appId);
+    group.appIds.insert(group.appIds.end(), entry.aliasAppIds.begin(),
+                        entry.aliasAppIds.end());
     removed.groups.push_back(std::move(group));
 
     Wh_Log(L"Removed %s from folder %s", entry.appId.c_str(),
@@ -1845,15 +1887,19 @@ std::vector<RemovedEntry> GetRemovedEntries(int folder) {
     }
 
     for (const auto& group : it->second.groups) {
+        if (group.cleared) {
+            continue;
+        }
+
         RemovedEntry entry;
-        entry.appId = group.front();
+        entry.appId = group.appIds.front();
         entry.name = GetAppInfo(entry.appId).displayName;
         if (entry.name.empty()) {
             std::wstring appIdLower = ToLower(entry.appId);
             for (const auto& button : g_buttons) {
                 if (button->appIdLower == appIdLower &&
                     !button->automationName.empty()) {
-                    entry.name = button->automationName;
+                    entry.name = ShortAutomationName(button->automationName);
                     break;
                 }
             }
@@ -1881,8 +1927,10 @@ void RestoreToFolder(int folder, const std::wstring& appId) {
     std::wstring appIdLower = ToLower(appId);
     auto& groups = it->second.groups;
     groups.erase(std::remove_if(groups.begin(), groups.end(),
-                                [&](const std::vector<std::wstring>& group) {
-                                    return ToLower(group.front()) == appIdLower;
+                                [&](const RemovedGroup& group) {
+                                    return !group.cleared &&
+                                           ToLower(group.appIds.front()) ==
+                                               appIdLower;
                                 }),
                  groups.end());
     if (groups.empty()) {
@@ -1893,6 +1941,28 @@ void RestoreToFolder(int folder, const std::wstring& appId) {
 
     SaveRemovedApps();
     ScheduleUpdate();
+}
+
+// Empties the folder menu's list of removed apps. The apps stay out of the
+// folder until its app list in the settings changes.
+void ClearRemovedList(int folder) {
+    if (folder < 0 || folder >= static_cast<int>(g_settings.folders.size())) {
+        return;
+    }
+
+    const auto& config = g_settings.folders[folder];
+    auto it = g_removedApps.find(config.key);
+    if (it == g_removedApps.end()) {
+        return;
+    }
+
+    for (auto& group : it->second.groups) {
+        group.cleared = true;
+    }
+
+    Wh_Log(L"Cleared the removed apps list of folder %s", config.name.c_str());
+
+    SaveRemovedApps();
 }
 
 wux::Media::SolidColorBrush TransparentBrush() {
@@ -2009,12 +2079,47 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
             winrt::Windows::UI::Color{0x40, 0x80, 0x80, 0x80}));
         panel.Children().Append(separator);
 
+        wuxc::Grid captionRow;
+        wuxc::ColumnDefinition captionColumn;
+        captionColumn.Width(wux::GridLength{1, wux::GridUnitType::Star});
+        wuxc::ColumnDefinition clearColumn;
+        clearColumn.Width(wux::GridLength{1, wux::GridUnitType::Auto});
+        captionRow.ColumnDefinitions().Append(captionColumn);
+        captionRow.ColumnDefinitions().Append(clearColumn);
+
         wuxc::TextBlock caption;
         caption.Text(L"Removed from this folder");
         caption.FontSize(12);
         caption.Opacity(0.6);
-        caption.Margin(wux::Thickness{8, 0, 8, 4});
-        panel.Children().Append(caption);
+        caption.VerticalAlignment(wux::VerticalAlignment::Center);
+        caption.Margin(wux::Thickness{8, 0, 8, 0});
+
+        wuxc::TextBlock clearLabel;
+        clearLabel.Text(L"Clear");
+        clearLabel.FontSize(12);
+
+        wuxc::Button clearButton;
+        clearButton.Content(clearLabel);
+        clearButton.Background(TransparentBrush());
+        clearButton.BorderThickness(wux::Thickness{0, 0, 0, 0});
+        clearButton.Padding(wux::Thickness{8, 4, 8, 4});
+        wuxc::ToolTipService::SetToolTip(
+            clearButton,
+            winrt::box_value(winrt::hstring(
+                L"Clear this list. The apps stay out of the folder.")));
+        wux::Automation::AutomationProperties::SetName(
+            clearButton, winrt::hstring(L"Clear the removed apps list"));
+        clearButton.Click([folder](auto const&, auto const&) {
+            Guarded([&] {
+                HideFolderMenu();
+                ClearRemovedList(folder);
+            });
+        });
+
+        wuxc::Grid::SetColumn(clearButton, 1);
+        captionRow.Children().Append(caption);
+        captionRow.Children().Append(clearButton);
+        panel.Children().Append(captionRow);
     }
 
     for (const auto& entry : removed) {
@@ -2172,6 +2277,8 @@ void ShowClassicMenuNow() {
             AppendMenuW(menu, MF_STRING,
                         kCmdRestoreBase + static_cast<UINT>(i), text.c_str());
         }
+        AppendMenuW(menu, MF_STRING, kCmdClearRemoved,
+                    L"Clear the removed apps list");
     }
 
     SetForegroundWindow(g_hwnd);
@@ -2187,7 +2294,10 @@ void ShowClassicMenuNow() {
 
     size_t count = pending.entries.size();
     size_t removedCount = pending.removed.size();
-    if (command >= kCmdRestoreBase && command < kCmdRestoreBase + removedCount) {
+    if (command == kCmdClearRemoved) {
+        ClearRemovedList(pending.folder);
+    } else if (command >= kCmdRestoreBase &&
+               command < kCmdRestoreBase + removedCount) {
         RestoreToFolder(pending.folder,
                         pending.removed[command - kCmdRestoreBase].appId);
     } else if (command >= kCmdRemoveBase && command < kCmdRemoveBase + count) {
