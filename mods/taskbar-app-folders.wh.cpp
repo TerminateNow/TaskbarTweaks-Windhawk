@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.7.1
+// @version         1.8
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -77,10 +77,30 @@ listed in more than one folder, the first folder wins.
   ended. Apps running as administrator can't be closed this way. If the
   program has any window open, even on another virtual desktop, the folder
   menu shows no Close button for it, since its processes might be shared with
-  that window (for example a browser's pinned web app).
+  that window (for example a browser's pinned web app). See "Browsers with
+  pinned web apps" below.
 * Some apps, such as Steam and Chrome, can show their windows under a separate
   taskbar icon from their pinned one. The folder menu still lists them once,
   under the pinned app.
+
+## Browsers with pinned web apps (PWAs)
+
+A web app (PWA) installed from a browser such as Helium or Chrome runs in the
+browser's own processes. While only the PWA is open, the browser looks like
+it's running too, so its folder menu entry is marked "Open" without a Close
+button, since closing it would also close the PWA.
+
+To change that, list the browser under **Apps with PWAs** in the settings, in
+the same format as a folder's apps, and choose a **PWA mode behavior**:
+
+* **Show as closed**: while the browser is only running for its PWAs, it isn't
+  marked "Open". Clicking it opens a new browser window.
+* **Show as open, Close ends all**: it's marked "Open", and its Close all
+  button closes the browser together with its PWAs, the same way as an app
+  that's running in the background. Any unsaved work in the PWAs can be lost.
+
+Apps not listed under Apps with PWAs aren't affected. Either way, a PWA you've
+pinned keeps its own taskbar icon while it's open.
 
 ## Limitations
 
@@ -145,6 +165,22 @@ Any of those values can be used in the folder's app list. Lines like
   $options:
   - modern: Modern (Windows 11 style)
   - classic: Classic context menu
+- pwaMode: closed
+  $name: PWA mode behavior
+  $description: >-
+    What the folder menu shows for an app listed under Apps with PWAs while
+    it's only running for its PWAs' windows. Show as closed: it isn't marked
+    Open, and clicking it opens a new window. Show as open, Close ends all: it's
+    marked Open, and its Close button closes it together with its PWAs.
+  $options:
+  - closed: Show as closed
+  - closeAll: Show as open, Close ends all
+- pwaApps: [""]
+  $name: Apps with PWAs
+  $description: >-
+    Browsers whose installed web apps (PWAs) you've pinned to the taskbar, for
+    example Helium or chrome.exe. Same format as a folder's apps. PWA mode
+    behavior applies only to these.
 */
 // ==/WindhawkModSettings==
 
@@ -288,6 +324,10 @@ struct Settings {
     std::wstring iconFolder;
     std::wstring defaultIcon;
     bool classicMenu = false;
+    // Apps listed under Apps with PWAs, normalized like FolderConfig::matchKeys.
+    std::vector<std::wstring> pwaMatchKeys;
+    // PWA mode behavior: true for "Show as open, Close ends all".
+    bool pwaCloseAll = false;
 };
 
 Settings g_settings;
@@ -399,6 +439,12 @@ struct MenuEntry {
     // Set when the app is open without any windows (e.g. only in the
     // notification area): the program whose processes Close ends.
     std::wstring backgroundExe;
+    // Listed under Apps with PWAs: a browser whose pinned web apps run in its
+    // processes.
+    bool pwaHost = false;
+    // Close ends backgroundExe even though another app's windows (its PWAs)
+    // run in its processes. Set by PWA mode behavior "Close ends all".
+    bool closeEndsOtherApps = false;
     // The app's own running taskbar button, used to switch to it.
     void* buttonKey = nullptr;
     // Running taskbar buttons of the same program under a different app ID,
@@ -623,6 +669,15 @@ Settings LoadSettings() {
     settings.iconFolder = StripQuotes(GetStringSetting(L"iconFolder"));
     settings.defaultIcon = Trim(GetStringSetting(L"defaultIcon"));
     settings.classicMenu = GetStringSetting(L"menuStyle") == L"classic";
+
+    for (int i = 0; i < kMaxAppsPerFolder; i++) {
+        std::wstring app = Trim(GetStringSetting(L"pwaApps[%d]", i));
+        if (app.empty()) {
+            break;
+        }
+        settings.pwaMatchKeys.push_back(NormalizeAppEntry(app));
+    }
+    settings.pwaCloseAll = GetStringSetting(L"pwaMode") == L"closeAll";
 
     return settings;
 }
@@ -1496,8 +1551,7 @@ struct RunningProcess {
 struct OpenAppsSnapshot {
     // Windows the taskbar shows on the current desktop.
     std::vector<OpenWindow> windows;
-    // Windows that the taskbar shows only on another virtual desktop. Their
-    // app IDs aren't read.
+    // Windows that the taskbar shows only on another virtual desktop.
     std::vector<OpenWindow> otherDesktopWindows;
     // Running processes in this session.
     std::vector<RunningProcess> processes;
@@ -1610,8 +1664,8 @@ OpenAppsSnapshot TakeOpenAppsSnapshot() {
             }
 
             // Cloaked only by its own app: not shown anywhere, so not really
-            // open. Chromium-based browsers keep such windows while they run
-            // in the background.
+            // open. Apps cloak windows they're preparing or keeping ready to
+            // show.
             if (cloak && !(cloak & (DWM_CLOAKED_SHELL | DWM_CLOAKED_INHERITED))) {
                 return TRUE;
             }
@@ -1625,16 +1679,12 @@ OpenAppsSnapshot TakeOpenAppsSnapshot() {
 
             OpenWindow window;
             window.hWnd = hWnd;
-            window.exePathLower = std::move(exePathLower);
-            if (cloak) {
-                // Cloaked by the shell: on another virtual desktop.
-                param->snapshot->otherDesktopWindows.push_back(
-                    std::move(window));
-                return TRUE;
-            }
-
             window.appIdLower = GetWindowAppIdLower(hWnd);
-            param->snapshot->windows.push_back(std::move(window));
+            window.exePathLower = std::move(exePathLower);
+            // Cloaked by the shell: on another virtual desktop.
+            (cloak ? param->snapshot->otherDesktopWindows
+                   : param->snapshot->windows)
+                .push_back(std::move(window));
             return TRUE;
         },
         reinterpret_cast<LPARAM>(&param));
@@ -1678,22 +1728,6 @@ std::wstring ExeFromWindows(const OpenAppsSnapshot& snapshot,
     return {};
 }
 
-// A window of the program that the taskbar shows, under any app ID or on any
-// virtual desktop. With one, the program isn't just running in the background:
-// its processes may be shared with another app (e.g. a browser's pinned web
-// app).
-const OpenWindow* FindProgramWindow(const std::wstring& exe,
-                                    const OpenAppsSnapshot& snapshot) {
-    for (const auto* list : {&snapshot.windows, &snapshot.otherDesktopWindows}) {
-        for (const auto& window : *list) {
-            if (IsSameProgram(exe, window.exePathLower)) {
-                return &window;
-            }
-        }
-    }
-    return nullptr;
-}
-
 void LogProgramWindow(const OpenWindow& window) {
     WCHAR className[256] = L"";
     GetClassNameW(window.hWnd, className, ARRAYSIZE(className));
@@ -1705,41 +1739,79 @@ void LogProgramWindow(const OpenWindow& window) {
            window.hWnd, className, title, window.appIdLower.c_str(), cloak);
 }
 
-void CountOpenWindows(MenuEntry& entry,
-                      const std::wstring& exe,
-                      const OpenAppsSnapshot& snapshot) {
+// File Explorer windows belong to explorer.exe, which is also the shell itself,
+// so they can only be told apart by app ID. That also keeps explorer.exe from
+// ever being ended as a background app.
+bool MatchesByProgram(const std::wstring& exe) {
+    return !exe.empty() && FileNameOf(exe) != L"explorer.exe";
+}
+
+// The windows that the taskbar shows for an entry's app and its program, by
+// whose they are.
+struct ProgramWindows {
+    // The entry's own windows on this desktop: the ones counted and closed.
+    std::vector<const OpenWindow*> own;
+    // One of its own windows on another virtual desktop, if any.
+    const OpenWindow* ownElsewhere = nullptr;
+    // A window of the same program that belongs to another pinned app, e.g. a
+    // browser's pinned web app (PWA), on any desktop.
+    const OpenWindow* otherApp = nullptr;
+};
+
+ProgramWindows FindProgramWindows(const MenuEntry& entry,
+                                  const std::wstring& exe,
+                                  const OpenAppsSnapshot& snapshot) {
     std::wstring appIdLower = ToLower(entry.appId);
     std::vector<std::wstring> aliasesLower;
     for (const auto& alias : entry.aliasAppIds) {
         aliasesLower.push_back(ToLower(alias));
     }
+    bool matchByProgram = MatchesByProgram(exe);
 
-    // File Explorer windows belong to explorer.exe, which is also the shell
-    // itself, so they can only be told apart by app ID.
-    bool matchByProgram = !exe.empty() && FileNameOf(exe) != L"explorer.exe";
+    ProgramWindows result;
+    for (const auto* list : {&snapshot.windows, &snapshot.otherDesktopWindows}) {
+        bool thisDesktop = list == &snapshot.windows;
+        for (const auto& window : *list) {
+            bool own =
+                window.appIdLower == appIdLower ||
+                std::find(aliasesLower.begin(), aliasesLower.end(),
+                          window.appIdLower) != aliasesLower.end();
+            bool sameProgram =
+                matchByProgram && IsSameProgram(exe, window.exePathLower);
 
-    for (const auto& window : snapshot.windows) {
-        bool matches =
-            window.appIdLower == appIdLower ||
-            std::find(aliasesLower.begin(), aliasesLower.end(),
-                      window.appIdLower) != aliasesLower.end();
+            // A window of the same program is the app's too, unless it
+            // belongs to another pinned app.
+            if (!own && sameProgram) {
+                own = window.appIdLower.empty() ||
+                      !IsPinnedAppId(window.appIdLower);
+                if (!own && !result.otherApp) {
+                    result.otherApp = &window;
+                }
+            }
 
-        // A window of the same program counts too, unless it belongs to
-        // another pinned app (e.g. a pinned web app of a browser).
-        if (!matches && matchByProgram &&
-            IsSameProgram(exe, window.exePathLower) &&
-            (window.appIdLower.empty() || !IsPinnedAppId(window.appIdLower))) {
-            matches = true;
+            if (own) {
+                if (thisDesktop) {
+                    result.own.push_back(&window);
+                } else if (!result.ownElsewhere) {
+                    result.ownElsewhere = &window;
+                }
+            }
         }
+    }
+    return result;
+}
 
-        if (matches) {
-            entry.windowCount++;
-            entry.windows.push_back(window.hWnd);
-        }
+void CountOpenWindows(MenuEntry& entry,
+                      const std::wstring& exe,
+                      const OpenAppsSnapshot& snapshot) {
+    ProgramWindows windows = FindProgramWindows(entry, exe, snapshot);
+    for (const OpenWindow* window : windows.own) {
+        entry.windowCount++;
+        entry.windows.push_back(window->hWnd);
     }
 
     bool processRunning = false;
-    if (matchByProgram) {
+    if (MatchesByProgram(exe)) {
         for (const auto& process : snapshot.processes) {
             if (IsSameProgram(exe, process.pathLower)) {
                 processRunning = true;
@@ -1750,23 +1822,98 @@ void CountOpenWindows(MenuEntry& entry,
 
     entry.running = entry.running || entry.windowCount > 0 || processRunning;
 
-    // Running without a taskbar button or any window, e.g. only in the
-    // notification area, so Close has to end its processes.
-    if (processRunning && entry.windowCount == 0) {
-        const OpenWindow* window = FindProgramWindow(exe, snapshot);
-        if (!entry.buttonKey && !window) {
-            entry.backgroundExe = exe;
-        } else {
-            Wh_Log(L"%s runs without windows of its own, but can't be closed "
-                   L"from the menu: %s",
-                   entry.appId.c_str(),
-                   entry.buttonKey ? L"it has a taskbar button"
-                                   : L"its program has another window");
-            if (window) {
-                LogProgramWindow(*window);
-            }
+    if (!processRunning || entry.windowCount > 0) {
+        return;
+    }
+
+    // Running without a window of its own, e.g. only in the notification
+    // area, so Close has to end its processes.
+    PCWSTR noCloseReason = nullptr;
+    const OpenWindow* blocking = nullptr;
+    if (entry.buttonKey) {
+        noCloseReason = L"it has a taskbar button";
+    } else if (windows.ownElsewhere) {
+        noCloseReason = L"it has a window on another desktop";
+        blocking = windows.ownElsewhere;
+    } else if (!windows.otherApp) {
+        entry.backgroundExe = exe;
+    } else if (!entry.pwaHost) {
+        // Its processes also run another app's windows, which ending them
+        // would close too.
+        noCloseReason = L"its program has another app's window";
+        blocking = windows.otherApp;
+    } else if (g_settings.pwaCloseAll) {
+        entry.backgroundExe = exe;
+        entry.closeEndsOtherApps = true;
+        Wh_Log(L"%s is only running for its PWAs: Close ends them too",
+               entry.appId.c_str());
+    } else {
+        entry.running = false;
+        Wh_Log(L"%s is only running for its PWAs: shown as closed",
+               entry.appId.c_str());
+    }
+
+    if (noCloseReason) {
+        Wh_Log(L"%s runs without windows of its own, but can't be closed "
+               L"from the menu: %s",
+               entry.appId.c_str(), noCloseReason);
+        if (blocking) {
+            LogProgramWindow(*blocking);
         }
     }
+}
+
+// The names a taskbar button's app goes by, to match against the app entries
+// in the settings.
+struct AppNames {
+    explicit AppNames(ButtonState* button) {
+        const AppInfo& info = GetAppInfo(button->appId);
+        appIdLower = button->appIdLower;
+        exeLower = info.exeLower;
+        exeStem = StripExe(info.exeLower);
+        displayNameLower = ToLower(info.displayName);
+        shortcutNameLower = ToLower(info.shortcutName);
+        automationNameLower = ToLower(button->automationName);
+        // In case the accessible name has extra details after the app's name.
+        automationNameShortLower = automationNameLower.substr(
+            0, automationNameLower.find(L" - "));
+    }
+
+    // matchKey is an entry from the settings, normalized with
+    // NormalizeAppEntry.
+    bool Matches(const std::wstring& matchKey) const {
+        return matchKey == appIdLower ||
+               (!exeLower.empty() &&
+                (matchKey == exeLower || matchKey == exeStem)) ||
+               (!displayNameLower.empty() && matchKey == displayNameLower) ||
+               (!shortcutNameLower.empty() && matchKey == shortcutNameLower) ||
+               (!automationNameLower.empty() &&
+                (matchKey == automationNameLower ||
+                 matchKey == automationNameShortLower));
+    }
+
+    std::wstring appIdLower;
+    std::wstring exeLower;
+    std::wstring exeStem;
+    std::wstring displayNameLower;
+    std::wstring shortcutNameLower;
+    std::wstring automationNameLower;
+    std::wstring automationNameShortLower;
+};
+
+// Whether the button's app is listed under Apps with PWAs.
+bool IsPwaHost(ButtonState* button) {
+    if (g_settings.pwaMatchKeys.empty() || button->appId.empty()) {
+        return false;
+    }
+
+    AppNames names(button);
+    for (const auto& matchKey : g_settings.pwaMatchKeys) {
+        if (names.Matches(matchKey)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::wstring MemberDisplayName(ButtonState* member) {
@@ -1828,6 +1975,7 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
         MenuEntry entry;
         entry.appId = member->appId;
         entry.name = MemberDisplayName(member);
+        entry.pwaHost = IsPwaHost(member);
         if (member->running) {
             entry.running = true;
             entry.buttonKey = member->key;
@@ -1882,6 +2030,7 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
             auto& entry = entries[*target];
             entry.aliasAppIds.push_back(member->appId);
             entry.running = true;
+            entry.pwaHost = entry.pwaHost || IsPwaHost(member);
             if (!entry.buttonKey) {
                 entry.buttonKey = member->key;
             }
@@ -1893,6 +2042,7 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
         entry.name = MemberDisplayName(member);
         entry.running = true;
         entry.buttonKey = member->key;
+        entry.pwaHost = IsPwaHost(member);
         entries.push_back(std::move(entry));
         entryExes.push_back(exe);
         entryOrders.push_back(member->order);
@@ -1915,6 +2065,7 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
                                     extra.aliasAppIds.begin(),
                                     extra.aliasAppIds.end());
             kept.running = kept.running || extra.running;
+            kept.pwaHost = kept.pwaHost || extra.pwaHost;
             if (!kept.buttonKey) {
                 kept.buttonKey = extra.buttonKey;
             }
@@ -2015,16 +2166,26 @@ void EndRemainingBackgroundApps() {
 // Closes an app that runs without windows, e.g. only in the notification area,
 // like Task Manager's End task: each of its processes is asked to quit, the
 // way taskkill does, by posting WM_CLOSE to its top-level windows (which are
-// all hidden). Those still running a few seconds later are ended.
+// all hidden, or with Close ends all, its PWAs' windows). Those still running
+// a few seconds later are ended.
 void CloseBackgroundApp(const MenuEntry& entry) {
     const std::wstring& exe = entry.backgroundExe;
 
     // The menu may have been open for a while. Leave the app alone if it got a
-    // window since, as ending it now could lose work in that window.
+    // window since, as ending it now could lose work in that window. Other
+    // apps' windows in its processes (its PWAs) only count without Close ends
+    // all.
     OpenAppsSnapshot snapshot = TakeOpenAppsSnapshot();
-    if (const OpenWindow* window = FindProgramWindow(exe, snapshot)) {
+    ProgramWindows windows = FindProgramWindows(entry, exe, snapshot);
+    const OpenWindow* blocking = windows.ownElsewhere;
+    if (!windows.own.empty()) {
+        blocking = windows.own.front();
+    } else if (!blocking && !entry.closeEndsOtherApps) {
+        blocking = windows.otherApp;
+    }
+    if (blocking) {
         Wh_Log(L"Not closing %s: it has windows now", exe.c_str());
-        LogProgramWindow(*window);
+        LogProgramWindow(*blocking);
         return;
     }
 
@@ -2108,7 +2269,8 @@ bool CanClose(const MenuEntry& entry) {
 }
 
 std::wstring CloseLabel(const MenuEntry& entry) {
-    return entry.windowCount >= 2 ? L"Close all" : L"Close";
+    return entry.windowCount >= 2 || entry.closeEndsOtherApps ? L"Close all"
+                                                              : L"Close";
 }
 
 void OpenMenuEntry(const MenuEntry& entry) {
@@ -2385,6 +2547,8 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
                 entry.windowCount >= 2
                     ? L"Close all " + std::to_wstring(entry.windowCount) +
                           L" " + entry.name + L" windows"
+                : entry.closeEndsOtherApps
+                    ? L"Close " + entry.name + L" and its PWAs"
                 : entry.windows.empty()
                     ? L"Close " + entry.name + L", running in the background"
                     : L"Close " + entry.name;
@@ -3127,29 +3291,12 @@ void MatchFolder(ButtonState* button) {
         return;
     }
 
-    const AppInfo& info = GetAppInfo(button->appId);
-    std::wstring displayNameLower = ToLower(info.displayName);
-    std::wstring automationNameLower = ToLower(button->automationName);
-    // In case the accessible name has extra details after the app's name.
-    std::wstring automationNameShortLower = automationNameLower.substr(
-        0, automationNameLower.find(L" - "));
-    std::wstring shortcutNameLower = ToLower(info.shortcutName);
-    std::wstring exeStem = StripExe(info.exeLower);
+    AppNames names(button);
 
     for (size_t i = 0; i < g_settings.folders.size(); i++) {
         const auto& folder = g_settings.folders[i];
         for (size_t k = 0; k < folder.matchKeys.size(); k++) {
-            const auto& entry = folder.matchKeys[k];
-            bool matches =
-                entry == button->appIdLower ||
-                (!info.exeLower.empty() &&
-                 (entry == info.exeLower || entry == exeStem)) ||
-                (!displayNameLower.empty() && entry == displayNameLower) ||
-                (!shortcutNameLower.empty() && entry == shortcutNameLower) ||
-                (!automationNameLower.empty() &&
-                 (entry == automationNameLower ||
-                  entry == automationNameShortLower));
-            if (!matches) {
+            if (!names.Matches(folder.matchKeys[k])) {
                 continue;
             }
 
