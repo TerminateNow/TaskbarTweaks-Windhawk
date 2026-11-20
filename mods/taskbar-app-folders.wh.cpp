@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.8
+// @version         1.9
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -83,6 +83,34 @@ listed in more than one folder, the first folder wins.
   taskbar icon from their pinned one. The folder menu still lists them once,
   under the pinned app.
 
+## Keeping open apps apart from pinned apps
+
+Turn on **Keep open apps apart from pinned apps** to split the taskbar into two
+groups:
+
+* Pinned apps and folders stay on the left, after the Start button.
+* Open apps are a separate group in the middle of the taskbar, like the
+  centered Windows 11 taskbar. That includes pinned apps while they're open:
+  an open pinned app moves to the middle, and goes back to its pinned spot
+  when it's closed.
+
+If the open apps don't fit in the middle, they move right as far as the
+system tray, and then sit right after the pinned apps.
+
+For the pinned apps to sit at the left edge, set **Taskbar alignment** to
+**Left** in Windows' taskbar settings (Settings > Personalization > Taskbar >
+Taskbar behaviors). With the default Center alignment, Windows centers
+everything as one row, so the two groups are only kept a little apart.
+
+Turn on **Separator after pinned apps** as well to draw a `|` line at the end
+of the pinned apps and folders.
+
+Dragging still works the way it does without the option: drag pinned apps and
+folders to reorder them, and drag open apps to reorder those. The two groups
+are always kept apart, so a pinned app dragged among the open apps goes back
+to the end of the pinned apps when it's dropped. Dragging an open pinned app
+can also change its pinned spot, since it's the same taskbar icon.
+
 ## Browsers with pinned web apps (PWAs)
 
 A web app (PWA) installed from a browser such as Helium or Chrome runs in the
@@ -110,6 +138,11 @@ pinned keeps its own taskbar icon while it's open.
   app's taskbar spot. While every app in a folder is open, the folder is hidden
   and each app shows on its own.
 * Keyboard shortcuts such as Win+1 still launch the app the folder sits on.
+* With **Keep open apps apart from pinned apps**, an open pinned app is only
+  drawn in the middle, so Windows may still open some things, such as its jump
+  list (right-click menu), at its pinned spot. While an app is being dragged,
+  the groups aren't rearranged until it's dropped. The option is ignored on a
+  taskbar laid out right to left.
 * Dragging the folder and opening its menu with a left click rely on Windows'
   debugging symbols for the taskbar, which Windhawk downloads the first time
   the mod loads. If that fails, the folder still opens its menu when clicked
@@ -165,6 +198,18 @@ Any of those values can be used in the folder's app list. Lines like
   $options:
   - modern: Modern (Windows 11 style)
   - classic: Classic context menu
+- separateRunning: false
+  $name: Keep open apps apart from pinned apps
+  $description: >-
+    Pinned apps and folders stay on the left, and open apps, including open
+    pinned apps, are a separate group in the middle of the taskbar. For the
+    pinned apps to sit at the left edge, set Taskbar alignment to Left in
+    Windows' taskbar settings.
+- pinnedSeparator: false
+  $name: Separator after pinned apps
+  $description: >-
+    Draws a | line at the end of the pinned apps and folders. Needs Keep open
+    apps apart from pinned apps.
 - pwaMode: closed
   $name: PWA mode behavior
   $description: >-
@@ -253,6 +298,15 @@ constexpr UINT kEndBackgroundAppsDelayMs = 5000;
 // it to still count as a click rather than a drag.
 constexpr int kClickMoveThreshold = 12;
 
+// Open apps kept apart from pinned apps (separateRunning), in DIPs: the
+// smallest space between the two groups, and the separator line drawn after
+// the pinned apps (pinnedSeparator).
+constexpr double kMinSectionGap = 8;
+constexpr double kSeparatorWidth = 2;
+constexpr double kSeparatorPadding = 8;
+constexpr double kSeparatorHeightRatio = 0.45;
+constexpr double kSeparatorOpacity = 0.55;
+
 constexpr UINT kCmdLaunchBase = 1000;
 constexpr UINT kCmdRemoveBase = 2000;
 constexpr UINT kCmdRestoreBase = 3000;
@@ -297,6 +351,14 @@ constexpr PROPERTYKEY kPKEY_AppUserModel_ID = {
      {0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3}},
     5};
 
+// Microsoft.UI.Xaml.Controls.IItemsRepeater (WinUI 2), the interface of the
+// taskbar's TaskbarFrameRepeater. Its GetElementIndex is vtable entry 19.
+constexpr GUID kIID_IItemsRepeater = {
+    0x0bd894f2,
+    0xedfc,
+    0x5ddf,
+    {0xa1, 0x66, 0x2d, 0xb1, 0x4b, 0xbf, 0xdf, 0x35}};
+
 constexpr CLSID kCLSID_ShellLink = {
     0x00021401,
     0x0000,
@@ -328,6 +390,10 @@ struct Settings {
     std::vector<std::wstring> pwaMatchKeys;
     // PWA mode behavior: true for "Show as open, Close ends all".
     bool pwaCloseAll = false;
+    // Keep open apps apart from pinned apps, and draw a separator after the
+    // pinned apps.
+    bool separateRunning = false;
+    bool pinnedSeparator = false;
 };
 
 Settings g_settings;
@@ -399,6 +465,18 @@ struct ButtonState {
     bool iconOverridden = false;
     bool applyingIcon = false;
     wux::Media::ImageSource originalIcon{nullptr};
+
+    // Open apps kept apart from pinned apps. The repeater the button is laid
+    // out in, the margin the mod set on top of the button's own (baseMargin),
+    // and the shift that draws an open pinned app among the open apps.
+    void* repeaterKey = nullptr;
+    bool marginOverridden = false;
+    wux::Thickness baseMargin{};
+    wux::Thickness appliedMargin{};
+    bool transformOverridden = false;
+    wux::Media::Transform originalTransform{nullptr};
+    wux::Media::TranslateTransform translate{nullptr};
+    wux::Media::TransformGroup transformGroup{nullptr};
 };
 
 std::vector<std::unique_ptr<ButtonState>> g_buttons;
@@ -678,6 +756,9 @@ Settings LoadSettings() {
         settings.pwaMatchKeys.push_back(NormalizeAppEntry(app));
     }
     settings.pwaCloseAll = GetStringSetting(L"pwaMode") == L"closeAll";
+
+    settings.separateRunning = Wh_GetIntSetting(L"separateRunning") != 0;
+    settings.pinnedSeparator = Wh_GetIntSetting(L"pinnedSeparator") != 0;
 
     return settings;
 }
@@ -3195,11 +3276,648 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
     button->templateAttached = true;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Open apps kept apart from pinned apps (separateRunning)
+//
+// The taskbar lays out its buttons in one row: pinned apps in their pinned
+// order (an open pinned app keeps its pinned spot), then other open apps. The
+// mod only adds margins to that row, so that the taskbar's own layout, and
+// with it dragging, keeps working:
+// * The last closed pinned button (the end of the pinned section) gets a right
+//   margin that puts the open apps after it in the middle of the taskbar.
+// * An open pinned app before it is collapsed to no width with a negative
+//   margin and drawn among the open apps with a TranslateTransform. Its space
+//   there is part of that right margin.
+// Everything is recomputed after each layout pass of the taskbar, except while
+// a button is pressed (e.g. being dragged), when the row's geometry is in flux.
+
+struct SectionsTaskbar {
+    void* key = nullptr;
+    winrt::weak_ref<wux::FrameworkElement> repeater;
+    winrt::event_token layoutUpdatedToken{};
+    winrt::weak_ref<wux::FrameworkElement> trayFrame;
+    bool trayLookedUp = false;
+    // The separator line, in a canvas added on top of the repeater.
+    winrt::weak_ref<wuxc::Panel> overlayParent;
+    winrt::weak_ref<wuxc::Canvas> overlay;
+    winrt::weak_ref<wuxc::Border> separator;
+    bool loggedCentered = false;
+};
+
+std::vector<std::unique_ptr<SectionsTaskbar>> g_sectionsTaskbars;
+bool g_arrangingSections = false;
+
+struct SectionItem {
+    ButtonState* button = nullptr;
+    wux::FrameworkElement element{nullptr};
+    int index = -1;
+    double x = 0;
+    double width = 0;
+    // The button's own margin, without what the mod added.
+    wux::Thickness base{};
+    // The space the button takes in the row with its own margin.
+    double extent = 0;
+};
+
+bool IsPointerHeld(ButtonState* button) {
+    return button->pointerDown &&
+           GetTickCount64() - button->pointerDownTime < 60 * 1000;
+}
+
+bool SameThickness(wux::Thickness const& a,
+                   wux::Thickness const& b,
+                   double tolerance = 0.01) {
+    return std::abs(a.Left - b.Left) < tolerance &&
+           std::abs(a.Top - b.Top) < tolerance &&
+           std::abs(a.Right - b.Right) < tolerance &&
+           std::abs(a.Bottom - b.Bottom) < tolerance;
+}
+
+// The button's margin without what the mod added. If something else set the
+// margin since, that's the button's own margin now.
+wux::Thickness SectionBaseMargin(ButtonState* button,
+                                 wux::FrameworkElement const& element) {
+    auto margin = element.Margin();
+    if (button->marginOverridden &&
+        SameThickness(margin, button->appliedMargin)) {
+        return button->baseMargin;
+    }
+
+    button->marginOverridden = false;
+    button->baseMargin = margin;
+    return margin;
+}
+
+void SetSectionMargin(ButtonState* button,
+                      wux::FrameworkElement const& element,
+                      wux::Thickness const& base,
+                      double extraLeft,
+                      double extraRight) {
+    if (std::abs(extraLeft) < 0.5 && std::abs(extraRight) < 0.5) {
+        if (button->marginOverridden) {
+            element.Margin(base);
+            button->marginOverridden = false;
+        }
+        return;
+    }
+
+    wux::Thickness margin = base;
+    margin.Left += extraLeft;
+    margin.Right += extraRight;
+    // Small changes are ignored, so that layout passes settle.
+    if (button->marginOverridden &&
+        SameThickness(margin, button->appliedMargin, 0.5)) {
+        return;
+    }
+
+    button->baseMargin = base;
+    button->appliedMargin = margin;
+    button->marginOverridden = true;
+    element.Margin(margin);
+}
+
+bool IsSectionTransform(ButtonState* button,
+                        wux::Media::Transform const& transform) {
+    if (!transform) {
+        return false;
+    }
+    void* ptr = CanonicalPtr(transform);
+    return (button->translate && ptr == CanonicalPtr(button->translate)) ||
+           (button->transformGroup &&
+            ptr == CanonicalPtr(button->transformGroup));
+}
+
+void SetSectionTranslate(ButtonState* button,
+                         wux::FrameworkElement const& element,
+                         double x) {
+    auto current = element.RenderTransform();
+    if (!button->transformOverridden || !IsSectionTransform(button, current)) {
+        // Any transform the button already has is kept, ahead of the mod's.
+        button->translate = wux::Media::TranslateTransform();
+        button->transformGroup = nullptr;
+        button->originalTransform = current;
+        if (current) {
+            element.RenderTransform(nullptr);
+            wux::Media::TransformGroup group;
+            group.Children().Append(current);
+            group.Children().Append(button->translate);
+            button->transformGroup = group;
+            element.RenderTransform(group);
+        } else {
+            element.RenderTransform(button->translate);
+        }
+        button->transformOverridden = true;
+    }
+
+    if (std::abs(button->translate.X() - x) >= 0.25) {
+        button->translate.X(x);
+    }
+}
+
+void RestoreSectionTranslate(ButtonState* button,
+                             wux::FrameworkElement const& element) {
+    if (!button->transformOverridden) {
+        return;
+    }
+
+    // If something else replaced the transform since, it's left alone.
+    if (element && IsSectionTransform(button, element.RenderTransform())) {
+        if (button->transformGroup) {
+            button->transformGroup.Children().Clear();
+        }
+        element.RenderTransform(button->originalTransform);
+    }
+
+    button->transformOverridden = false;
+    button->originalTransform = nullptr;
+    button->translate = nullptr;
+    button->transformGroup = nullptr;
+}
+
+// Undoes the margin and transform set for keeping open apps apart.
+void RestoreSectionLayout(ButtonState* button) {
+    auto element = button->element.get();
+
+    Guarded([&] {
+        if (element && button->marginOverridden &&
+            SameThickness(element.Margin(), button->appliedMargin)) {
+            element.Margin(button->baseMargin);
+        }
+    });
+    button->marginOverridden = false;
+
+    Guarded([&] { RestoreSectionTranslate(button, element); });
+}
+
+std::optional<int> GetRepeaterElementIndex(
+    wux::FrameworkElement const& repeater,
+    wux::UIElement const& element) {
+    winrt::com_ptr<IUnknown> itemsRepeater;
+    if (FAILED(winrt::get_unknown(repeater)->QueryInterface(
+            kIID_IItemsRepeater, itemsRepeater.put_void()))) {
+        return std::nullopt;
+    }
+
+    using GetElementIndex_t =
+        HRESULT(STDMETHODCALLTYPE*)(void* pThis, void* element, int* index);
+    void** vtable = *reinterpret_cast<void***>(itemsRepeater.get());
+    auto getElementIndex = reinterpret_cast<GetElementIndex_t>(vtable[19]);
+
+    int index = -1;
+    if (FAILED(getElementIndex(itemsRepeater.get(), winrt::get_abi(element),
+                               &index))) {
+        return -1;
+    }
+    return index;
+}
+
+wux::FrameworkElement FindDescendantByClassName(
+    wux::DependencyObject const& root,
+    std::wstring_view className) {
+    std::vector<std::pair<wux::DependencyObject, int>> queue{{root, 0}};
+    for (size_t i = 0; i < queue.size(); i++) {
+        auto [element, depth] = queue[i];
+        if (i > 0 && winrt::get_class_name(element) == className) {
+            return element.try_as<wux::FrameworkElement>();
+        }
+
+        if (depth >= 12) {
+            continue;
+        }
+
+        int count = wux::Media::VisualTreeHelper::GetChildrenCount(element);
+        for (int j = 0; j < count; j++) {
+            queue.emplace_back(
+                wux::Media::VisualTreeHelper::GetChild(element, j), depth + 1);
+        }
+    }
+    return nullptr;
+}
+
+wuxc::Border EnsureSeparator(SectionsTaskbar& taskbar,
+                             wux::FrameworkElement const& repeater) {
+    auto separator = taskbar.separator.get();
+    auto overlay = taskbar.overlay.get();
+    if (separator && overlay &&
+        wux::Media::VisualTreeHelper::GetParent(overlay)) {
+        return separator;
+    }
+
+    auto parent = wux::Media::VisualTreeHelper::GetParent(repeater)
+                      .try_as<wuxc::Panel>();
+    if (!parent) {
+        return nullptr;
+    }
+
+    // A canvas with no size at the top left of the repeater's parent. It
+    // doesn't take part in its layout, and the line is placed in it by
+    // coordinates.
+    wuxc::Canvas canvas;
+    canvas.IsHitTestVisible(false);
+    canvas.HorizontalAlignment(wux::HorizontalAlignment::Left);
+    canvas.VerticalAlignment(wux::VerticalAlignment::Top);
+
+    wuxc::Border line;
+    line.IsHitTestVisible(false);
+    line.Width(kSeparatorWidth);
+    line.CornerRadius(wux::CornerRadius{kSeparatorWidth / 2,
+                                        kSeparatorWidth / 2,
+                                        kSeparatorWidth / 2,
+                                        kSeparatorWidth / 2});
+    line.Opacity(kSeparatorOpacity);
+    line.Visibility(wux::Visibility::Collapsed);
+    canvas.Children().Append(line);
+
+    parent.Children().Append(canvas);
+
+    taskbar.overlayParent = winrt::make_weak(parent);
+    taskbar.overlay = winrt::make_weak(canvas);
+    taskbar.separator = winrt::make_weak(line);
+    return line;
+}
+
+void HideSeparator(SectionsTaskbar& taskbar) {
+    if (auto separator = taskbar.separator.get()) {
+        if (separator.Visibility() != wux::Visibility::Collapsed) {
+            separator.Visibility(wux::Visibility::Collapsed);
+        }
+    }
+}
+
+void RemoveSeparator(SectionsTaskbar& taskbar) {
+    auto parent = taskbar.overlayParent.get();
+    auto overlay = taskbar.overlay.get();
+    if (parent && overlay) {
+        uint32_t index;
+        if (parent.Children().IndexOf(overlay, index)) {
+            parent.Children().RemoveAt(index);
+        }
+    }
+
+    taskbar.overlayParent = nullptr;
+    taskbar.overlay = nullptr;
+    taskbar.separator = nullptr;
+}
+
+// Draws the separator line at x, in the repeater's coordinates, centered
+// vertically on the last pinned button.
+void PlaceSeparator(SectionsTaskbar& taskbar,
+                    wux::FrameworkElement const& repeater,
+                    SectionItem const& pinnedEnd,
+                    double x) {
+    auto separator = EnsureSeparator(taskbar, repeater);
+    auto overlay = taskbar.overlay.get();
+    if (!separator || !overlay) {
+        return;
+    }
+
+    double buttonHeight = pinnedEnd.element.ActualHeight();
+    double height =
+        std::max(12.0, std::round(buttonHeight * kSeparatorHeightRatio));
+    auto origin = repeater.TransformToVisual(overlay).TransformPoint(
+        {static_cast<float>(x), 0});
+    auto buttonTop = pinnedEnd.element.TransformToVisual(overlay)
+                         .TransformPoint({0, 0})
+                         .Y;
+    double left = std::round(origin.X);
+    double top = std::round(buttonTop + (buttonHeight - height) / 2);
+
+    if (wuxc::Canvas::GetLeft(separator) != left) {
+        wuxc::Canvas::SetLeft(separator, left);
+    }
+    if (wuxc::Canvas::GetTop(separator) != top) {
+        wuxc::Canvas::SetTop(separator, top);
+    }
+    if (separator.Height() != height) {
+        separator.Height(height);
+    }
+
+    // The color of the taskbar's text, which follows the light or dark theme.
+    if (auto control = pinnedEnd.element.try_as<wuxc::Control>()) {
+        auto brush = control.Foreground();
+        if (brush && separator.Background() != brush) {
+            separator.Background(brush);
+        }
+    }
+
+    if (separator.Visibility() != wux::Visibility::Visible) {
+        separator.Visibility(wux::Visibility::Visible);
+    }
+}
+
+void ArrangeSections(SectionsTaskbar& taskbar) {
+    if (g_unloading || g_arrangingSections || !g_settings.separateRunning) {
+        return;
+    }
+
+    auto repeater = taskbar.repeater.get();
+    if (!repeater) {
+        return;
+    }
+
+    auto root = wux::Media::VisualTreeHelper::GetParent(repeater)
+                    .try_as<wux::FrameworkElement>();
+    if (!root) {
+        return;
+    }
+
+    g_arrangingSections = true;
+    struct ArrangingGuard {
+        ~ArrangingGuard() { g_arrangingSections = false; }
+    } arrangingGuard;
+
+    std::vector<SectionItem> items;
+    bool frozen = false;
+    bool haveIndexes = true;
+    for (auto& button : g_buttons) {
+        if (button->repeaterKey != taskbar.key) {
+            continue;
+        }
+
+        auto element = button->element.get();
+        if (!element) {
+            continue;
+        }
+
+        if (button->collapsedByUs || button->recycled ||
+            element.Visibility() != wux::Visibility::Visible) {
+            RestoreSectionLayout(button.get());
+            continue;
+        }
+
+        if (IsPointerHeld(button.get())) {
+            frozen = true;
+        }
+
+        SectionItem item;
+        item.button = button.get();
+        item.element = element;
+        if (haveIndexes) {
+            auto index = GetRepeaterElementIndex(repeater, element);
+            if (index) {
+                item.index = *index;
+            } else {
+                haveIndexes = false;
+            }
+        }
+        items.push_back(std::move(item));
+    }
+
+    // A pressed button may be being dragged. The groups are rearranged once
+    // it's released.
+    if (frozen) {
+        return;
+    }
+
+    double rootWidth = root.ActualWidth();
+    bool horizontal = rootWidth > 0 && rootWidth >= root.ActualHeight();
+    if (!horizontal ||
+        repeater.FlowDirection() == wux::FlowDirection::RightToLeft) {
+        for (auto& item : items) {
+            RestoreSectionLayout(item.button);
+        }
+        HideSeparator(taskbar);
+        return;
+    }
+
+    for (auto& item : items) {
+        item.x = item.element.ActualOffset().x;
+        item.width = item.element.ActualWidth();
+        item.base = SectionBaseMargin(item.button, item.element);
+        item.extent = item.base.Left + item.width + item.base.Right;
+    }
+
+    if (haveIndexes) {
+        // Buttons that aren't in the row (e.g. kept for reuse) have no index.
+        items.erase(std::remove_if(items.begin(), items.end(),
+                                   [](SectionItem const& item) {
+                                       if (item.index >= 0) {
+                                           return false;
+                                       }
+                                       RestoreSectionLayout(item.button);
+                                       return true;
+                                   }),
+                    items.end());
+        std::sort(items.begin(), items.end(), [](auto const& a, auto const& b) {
+            return a.index < b.index;
+        });
+    } else {
+        // By position. A collapsed button starts where the next one does.
+        std::stable_sort(items.begin(), items.end(),
+                         [](auto const& a, auto const& b) {
+                             if (std::abs(a.x - b.x) >= 0.5) {
+                                 return a.x < b.x;
+                             }
+                             return a.button->transformOverridden &&
+                                    !b.button->transformOverridden;
+                         });
+    }
+
+    int pinnedEnd = -1;
+    double runningWidth = 0;
+    bool anyRunning = false;
+    for (int i = 0; i < static_cast<int>(items.size()); i++) {
+        if (items[i].button->running) {
+            runningWidth += items[i].extent;
+            anyRunning = true;
+        } else {
+            pinnedEnd = i;
+        }
+    }
+
+    // In the repeater's coordinates: the middle of the taskbar, and how far
+    // right the open apps can go before reaching the system tray.
+    double originX =
+        repeater.TransformToVisual(root).TransformPoint({0, 0}).X;
+    double centerX = rootWidth / 2 - originX;
+    double limitX = rootWidth - originX;
+
+    auto trayFrame = taskbar.trayFrame.get();
+    if (!trayFrame && !taskbar.trayLookedUp) {
+        taskbar.trayLookedUp = true;
+        trayFrame = FindDescendantByClassName(root, L"SystemTray.SystemTrayFrame");
+        taskbar.trayFrame = trayFrame ? winrt::make_weak(trayFrame) : nullptr;
+    }
+    if (trayFrame && trayFrame.XamlRoot() == root.XamlRoot()) {
+        double trayX =
+            trayFrame.TransformToVisual(root).TransformPoint({0, 0}).X;
+        if (trayX > 0 && trayX <= rootWidth) {
+            limitX = trayX - originX;
+        }
+    }
+
+    double runningStart = std::min(centerX - runningWidth / 2,
+                                   limitX - runningWidth);
+
+    if (pinnedEnd < 0) {
+        // Only open apps: the first one moves the group to the middle.
+        for (size_t i = 0; i < items.size(); i++) {
+            auto& item = items[i];
+            RestoreSectionTranslate(item.button, item.element);
+            double extraLeft = 0;
+            if (i == 0 && anyRunning) {
+                double slotStart = item.x - item.element.Margin().Left;
+                extraLeft = std::max(0.0, std::round(runningStart - slotStart));
+            }
+            SetSectionMargin(item.button, item.element, item.base, extraLeft,
+                             0);
+        }
+        HideSeparator(taskbar);
+        return;
+    }
+
+    auto& end = items[pinnedEnd];
+    double pinnedRight = end.x + end.width + end.base.Right;
+
+    if (!taskbar.loggedCentered && originX > rootWidth / 5) {
+        taskbar.loggedCentered = true;
+        Wh_Log(L"The taskbar looks center-aligned. For pinned apps to sit at "
+               L"the left edge, set Taskbar alignment to Left");
+    }
+
+    double minGap = g_settings.pinnedSeparator
+                        ? kSeparatorPadding * 2 + kSeparatorWidth
+                        : kMinSectionGap;
+    double gap = 0;
+    if (anyRunning) {
+        gap = std::max(std::round(runningStart - pinnedRight), minGap);
+    } else if (g_settings.pinnedSeparator) {
+        gap = minGap;
+    }
+
+    // Open pinned apps before the end of the pinned apps are drawn in order at
+    // the start of the open apps, in space reserved by the margin after the
+    // last pinned app.
+    double cursor = pinnedRight + gap;
+    double movedWidth = 0;
+    for (int i = 0; i < pinnedEnd; i++) {
+        auto& item = items[i];
+        if (!item.button->running) {
+            continue;
+        }
+
+        // A negative right margin as wide as the button with its own margin
+        // makes it take no space in the row.
+        SetSectionMargin(item.button, item.element, item.base, 0,
+                         -item.extent);
+        SetSectionTranslate(item.button, item.element,
+                            cursor + item.base.Left - item.x);
+        cursor += item.extent;
+        movedWidth += item.extent;
+    }
+
+    for (int i = 0; i < static_cast<int>(items.size()); i++) {
+        auto& item = items[i];
+        if (i < pinnedEnd && item.button->running) {
+            continue;
+        }
+
+        RestoreSectionTranslate(item.button, item.element);
+        SetSectionMargin(item.button, item.element, item.base, 0,
+                         i == pinnedEnd ? gap + movedWidth : 0);
+    }
+
+    if (g_settings.pinnedSeparator) {
+        PlaceSeparator(taskbar, repeater, end,
+                       pinnedRight + kSeparatorPadding);
+    } else {
+        HideSeparator(taskbar);
+    }
+}
+
+SectionsTaskbar* FindSectionsTaskbar(void* key) {
+    for (auto& taskbar : g_sectionsTaskbars) {
+        if (taskbar->key == key) {
+            return taskbar.get();
+        }
+    }
+    return nullptr;
+}
+
+void TearDownSections() {
+    for (auto& taskbar : g_sectionsTaskbars) {
+        Guarded([&] {
+            auto repeater = taskbar->repeater.get();
+            if (repeater && taskbar->layoutUpdatedToken) {
+                repeater.LayoutUpdated(taskbar->layoutUpdatedToken);
+            }
+        });
+        Guarded([&] { RemoveSeparator(*taskbar); });
+    }
+    g_sectionsTaskbars.clear();
+
+    for (auto& button : g_buttons) {
+        RestoreSectionLayout(button.get());
+        button->repeaterKey = nullptr;
+    }
+}
+
+void ArrangeAllSections() {
+    if (!g_settings.separateRunning) {
+        TearDownSections();
+        return;
+    }
+
+    // Taskbars whose row is gone, e.g. after a display change.
+    std::erase_if(g_sectionsTaskbars, [](auto const& taskbar) {
+        if (taskbar->repeater.get()) {
+            // Look for the system tray again if it wasn't there yet.
+            if (!taskbar->trayFrame.get()) {
+                taskbar->trayLookedUp = false;
+            }
+            return false;
+        }
+        Guarded([&] { RemoveSeparator(*taskbar); });
+        return true;
+    });
+
+    // Only buttons in the taskbar's main row, not e.g. in the overflow menu.
+    for (auto& button : g_buttons) {
+        Guarded([&] {
+            void* repeaterKey = nullptr;
+            if (auto element = button->element.get()) {
+                auto parent = wux::Media::VisualTreeHelper::GetParent(element)
+                                  .try_as<wux::FrameworkElement>();
+                if (parent && parent.Name() == L"TaskbarFrameRepeater") {
+                    repeaterKey = CanonicalPtr(parent);
+                    if (!FindSectionsTaskbar(repeaterKey)) {
+                        auto taskbar = std::make_unique<SectionsTaskbar>();
+                        taskbar->key = repeaterKey;
+                        taskbar->repeater = winrt::make_weak(parent);
+                        // Runs after every layout pass, e.g. when a button
+                        // changes size or the taskbar is resized.
+                        taskbar->layoutUpdatedToken = parent.LayoutUpdated(
+                            [repeaterKey](auto const&, auto const&) {
+                                Guarded([&] {
+                                    if (auto* taskbar =
+                                            FindSectionsTaskbar(repeaterKey)) {
+                                        ArrangeSections(*taskbar);
+                                    }
+                                });
+                            });
+                        g_sectionsTaskbars.push_back(std::move(taskbar));
+                    }
+                }
+            }
+
+            if (repeaterKey != button->repeaterKey) {
+                RestoreSectionLayout(button.get());
+                button->repeaterKey = repeaterKey;
+            }
+        });
+    }
+
+    for (auto& taskbar : g_sectionsTaskbars) {
+        Guarded([&] { ArrangeSections(*taskbar); });
+    }
+}
+
 // Restores everything the mod changed on the button and removes its handlers.
 void DetachButton(ButtonState* button) {
     auto element = button->element.get();
 
     Guarded([&] { RestoreIcon(button); });
+    RestoreSectionLayout(button);
 
     if (element) {
         Guarded([&] {
@@ -3442,6 +4160,8 @@ void UpdateAll() {
             ApplyButtonState(button.get(), host, collapse);
         });
     }
+
+    ArrangeAllSections();
 }
 
 void OnButtonAdded(wux::FrameworkElement const& element, InstanceHandle handle) {
@@ -3536,6 +4256,7 @@ void InitializeForCurrentThread() {
 
 void UninitializeForCurrentThread() {
     Guarded([] { HideFolderMenu(); });
+    Guarded([] { TearDownSections(); });
 
     for (auto& button : g_buttons) {
         DetachButton(button.get());
