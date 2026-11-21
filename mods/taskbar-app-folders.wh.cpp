@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.9
+// @version         1.10
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -50,6 +50,11 @@ listed in more than one folder, the first folder wins.
 
 * The folder sits where its first closed app is pinned. The apps listed after
   it are hidden from the taskbar.
+* When every app in a folder is open, for example the only app of a folder
+  with one app, the folder stays on the taskbar: it sits on its first app's
+  taskbar icon. The folder then shows that the app is open, like the app's
+  own icon would, and hovering it shows the app's window previews. Clicking
+  the folder still opens its menu, where you can switch to the app.
 * Clicking the folder opens its menu. Click an app to open it.
 * Drag the folder to move it, like any other pinned icon. This moves the app
   the folder sits on, so the folder stays in its new spot.
@@ -64,7 +69,8 @@ listed in more than one folder, the first folder wins.
   the list in the settings.
   If you remove every app in a folder, the folder disappears, so its menu
   can't restore them. Change its app list in the settings to bring them back.
-* An open app gets its own taskbar icon and also stays in the folder menu,
+* An open app gets its own taskbar icon (unless the folder sits on it, see
+  above) and also stays in the folder menu,
   marked "Open", or with its window count when it has more than one, for
   example "Open | 2". Clicking it in the menu switches to it, and its Close
   button (Close all, with more than one window) closes its windows. Apps
@@ -92,7 +98,8 @@ groups:
 * Open apps are a separate group in the middle of the taskbar, like the
   centered Windows 11 taskbar. That includes pinned apps while they're open:
   an open pinned app moves to the middle, and goes back to its pinned spot
-  when it's closed.
+  when it's closed. A folder stays with the pinned apps even while it sits on
+  an open app.
 
 If the open apps don't fit in the middle, they move right as far as the
 system tray, and then sit right after the pinned apps.
@@ -134,9 +141,9 @@ pinned keeps its own taskbar icon while it's open.
 
 * Windows 11 taskbar only. The Windows 10 taskbar, and the Windows 10 taskbar
   restored by ExplorerPatcher, aren't supported.
-* The folder needs at least one of its apps to be closed, since it sits on that
-  app's taskbar spot. While every app in a folder is open, the folder is hidden
-  and each app shows on its own.
+* The folder sits on one of its apps' taskbar icons. While every app in a
+  folder is open, the app it sits on has no taskbar icon of its own, and its
+  jump list (right-click menu) can't be opened from the taskbar.
 * Keyboard shortcuts such as Win+1 still launch the app the folder sits on.
 * With **Keep open apps apart from pinned apps**, an open pinned app is only
   drawn in the middle, so Windows may still open some things, such as its jump
@@ -146,7 +153,9 @@ pinned keeps its own taskbar icon while it's open.
 * Dragging the folder and opening its menu with a left click rely on Windows'
   debugging symbols for the taskbar, which Windhawk downloads the first time
   the mod loads. If that fails, the folder still opens its menu when clicked
-  but can't be dragged.
+  but can't be dragged. Two parts of the taskbar are used: one for folders
+  with a closed app, and one for folders whose apps are all open, so either
+  kind can lose dragging on its own.
 
 ## If an app isn't added to its folder
 
@@ -575,6 +584,22 @@ using CTaskBand_Launch_t = long(WINAPI*)(void* pThis,
                                          int options);
 CTaskBand_Launch_t CTaskBand_Launch_Original;
 bool g_launchHooked = false;
+
+// Every click on a taskbar button, open or not, goes through here. With it, a
+// click on a folder that sits on an open app can be turned into the folder
+// menu too, instead of switching to the app.
+using CTaskListWnd__HandleClick_t = void(WINAPI*)(void* pThis,
+                                                  void* taskBtnGroup,
+                                                  int taskItemIndex,
+                                                  int clickAction,
+                                                  int param4,
+                                                  int param5);
+CTaskListWnd__HandleClick_t CTaskListWnd__HandleClick_Original;
+bool g_clickHooked = false;
+
+// Apps seen with a closed taskbar button, which means they're pinned. A folder
+// whose apps are all open only sits on a pinned app.
+std::vector<std::wstring> g_closedPinnedAppIds;
 
 DWORD g_uiThreadId = 0;
 HWND g_hwnd = nullptr;
@@ -2934,6 +2959,20 @@ void ShowFolderMenu(ButtonState* host) {
     }
 }
 
+// Whether a left or middle press on a folder goes through to the taskbar, so
+// that the folder can be dragged, and the click is turned into the folder menu
+// by a hook. A folder on an open app needs the click hook: without it the
+// taskbar only reports a click on an open app as switching to it.
+bool HostPressPassesThrough(ButtonState* button) {
+    return g_clickHooked || (g_launchHooked && !button->running);
+}
+
+// Whether the mod handles every click on the button itself.
+bool HostTakesOverClicks(void* key) {
+    ButtonState* button = FindButton(key);
+    return button && button->isHost && !HostPressPassesThrough(button);
+}
+
 // Handlers on the template root, which run before the button's own handling.
 // With the launch hook, only right clicks on a folder are taken over here: a
 // left press goes through so that the folder can be dragged, and the click is
@@ -2952,7 +2991,7 @@ void OnPointerPressed(void* key, wux::Input::PointerRoutedEventArgs const& e) {
 
     bool rightButton =
         e.GetCurrentPoint(root).Properties().IsRightButtonPressed();
-    if (g_launchHooked && !rightButton) {
+    if (HostPressPassesThrough(button) && !rightButton) {
         return;
     }
 
@@ -2975,7 +3014,7 @@ void OnPointerReleased(void* key, wux::Input::PointerRoutedEventArgs const& e) {
     bool wasPressed = g_press.active && g_press.key == key &&
                       g_press.pointerId == e.Pointer().PointerId();
     if (!wasPressed) {
-        if (button->isHost && !g_launchHooked) {
+        if (button->isHost && !HostPressPassesThrough(button)) {
             e.Handled(true);
         }
         return;
@@ -3018,7 +3057,7 @@ void OnButtonPointerDown(void* key, wux::Input::PointerRoutedEventArgs const& e)
         button->frozenRunning = button->running;
     }
 
-    if (!g_launchHooked || !button->isHost) {
+    if (!button->isHost || !HostPressPassesThrough(button)) {
         return;
     }
 
@@ -3092,6 +3131,25 @@ long WINAPI CTaskBand_Launch_Hook(void* pThis,
     }
 
     return CTaskBand_Launch_Original(pThis, taskGroup, point, options);
+}
+
+void WINAPI CTaskListWnd__HandleClick_Hook(void* pThis,
+                                           void* taskBtnGroup,
+                                           int taskItemIndex,
+                                           int clickAction,
+                                           int param4,
+                                           int param5) {
+    void* key = nullptr;
+    if (TakeHostClick(&key)) {
+        Wh_Log(L"Showing a folder menu instead of click action %d",
+               clickAction);
+        g_menuRequestKey = key;
+        PostMessageW(g_hwnd, kMsgShowFolderMenu, 0, 0);
+        return;
+    }
+
+    CTaskListWnd__HandleClick_Original(pThis, taskBtnGroup, taskItemIndex,
+                                       clickAction, param4, param5);
 }
 
 bool IsHostButton(void* key) {
@@ -3204,9 +3262,9 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
     button->tappedToken = root.Tapped(
         [key](auto const&, wux::Input::TappedRoutedEventArgs const& e) {
             Guarded([&] {
-                // With the launch hook, a left click has to reach the taskbar
-                // for the hook to turn it into the folder menu.
-                if (!g_launchHooked && IsHostButton(key)) {
+                // With the click or launch hook, a left click has to reach
+                // the taskbar for the hook to turn it into the folder menu.
+                if (HostTakesOverClicks(key)) {
                     e.Handled(true);
                 }
             });
@@ -3214,9 +3272,9 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
     button->doubleTappedToken = root.DoubleTapped(
         [key](auto const&, wux::Input::DoubleTappedRoutedEventArgs const& e) {
             Guarded([&] {
-                // With the launch hook, a left click has to reach the taskbar
-                // for the hook to turn it into the folder menu.
-                if (!g_launchHooked && IsHostButton(key)) {
+                // With the click or launch hook, a left click has to reach
+                // the taskbar for the hook to turn it into the folder menu.
+                if (HostTakesOverClicks(key)) {
                     e.Handled(true);
                 }
             });
@@ -3318,6 +3376,12 @@ struct SectionItem {
     // The space the button takes in the row with its own margin.
     double extent = 0;
 };
+
+// Open apps go in the middle, except one that a folder sits on (when all the
+// folder's apps are open), which stays with the pinned apps.
+bool InRunningSection(ButtonState* button) {
+    return button->running && !button->isHost;
+}
 
 bool IsPointerHeld(ButtonState* button) {
     return button->pointerDown &&
@@ -3717,7 +3781,7 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
     double runningWidth = 0;
     bool anyRunning = false;
     for (int i = 0; i < static_cast<int>(items.size()); i++) {
-        if (items[i].button->running) {
+        if (InRunningSection(items[i].button)) {
             runningWidth += items[i].extent;
             anyRunning = true;
         } else {
@@ -3792,7 +3856,7 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
     double movedWidth = 0;
     for (int i = 0; i < pinnedEnd; i++) {
         auto& item = items[i];
-        if (!item.button->running) {
+        if (!InRunningSection(item.button)) {
             continue;
         }
 
@@ -3808,7 +3872,7 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
 
     for (int i = 0; i < static_cast<int>(items.size()); i++) {
         auto& item = items[i];
-        if (i < pinnedEnd && item.button->running) {
+        if (i < pinnedEnd && InRunningSection(item.button)) {
             continue;
         }
 
@@ -4077,6 +4141,11 @@ void RefreshButton(ButtonState* button) {
 
     int previousFolder = button->folder;
     button->recycled = IsRecycled(button, element);
+    if (!button->running && !button->recycled && !button->appId.empty() &&
+        std::find(g_closedPinnedAppIds.begin(), g_closedPinnedAppIds.end(),
+                  button->appIdLower) == g_closedPinnedAppIds.end()) {
+        g_closedPinnedAppIds.push_back(button->appIdLower);
+    }
     if (button->recycled) {
         button->folder = -1;
         button->order = 0;
@@ -4123,6 +4192,17 @@ void ApplyButtonState(ButtonState* button, bool host, bool collapse) {
     }
 }
 
+// Whether the button is a pinned app's: it was seen closed, or the app has a
+// pinned shortcut.
+bool IsPinnedButton(ButtonState* button) {
+    if (std::find(g_closedPinnedAppIds.begin(), g_closedPinnedAppIds.end(),
+                  button->appIdLower) != g_closedPinnedAppIds.end()) {
+        return true;
+    }
+    return !button->appId.empty() &&
+           !GetAppInfo(button->appId).shortcutPath.empty();
+}
+
 void UpdateAll() {
     if (g_unloading) {
         return;
@@ -4133,29 +4213,51 @@ void UpdateAll() {
     }
 
     // In each taskbar, a folder sits on its first member that isn't running.
+    // If they're all running, it sits on the first running one that's pinned,
+    // so that the folder stays on the taskbar.
     std::map<std::pair<int, void*>, ButtonState*> hosts;
+    std::map<std::pair<int, void*>, ButtonState*> runningHosts;
     for (auto& button : g_buttons) {
-        if (button->folder < 0 || button->running ||
-            !button->element.get()) {
+        if (button->folder < 0 || !button->element.get()) {
             continue;
         }
 
         auto key = std::make_pair(button->folder, button->rootKey);
-        auto it = hosts.find(key);
-        if (it == hosts.end() || button->order < it->second->order) {
-            hosts[key] = button.get();
+        if (!button->running) {
+            auto it = hosts.find(key);
+            if (it == hosts.end() || button->order < it->second->order) {
+                hosts[key] = button.get();
+            }
+            continue;
         }
+
+        if (!IsPinnedButton(button.get())) {
+            continue;
+        }
+
+        // The current host wins a tie (e.g. an app with a button per window),
+        // so that the folder doesn't jump between them.
+        auto it = runningHosts.find(key);
+        if (it == runningHosts.end() || button->order < it->second->order ||
+            (button->order == it->second->order && button->isHost &&
+             !it->second->isHost)) {
+            runningHosts[key] = button.get();
+        }
+    }
+
+    for (auto& [key, button] : runningHosts) {
+        hosts.try_emplace(key, button);
     }
 
     for (auto& button : g_buttons) {
         Guarded([&] {
             bool host = false;
             bool collapse = false;
-            if (button->folder >= 0 && !button->running) {
+            if (button->folder >= 0) {
                 auto it =
                     hosts.find(std::make_pair(button->folder, button->rootKey));
                 host = it != hosts.end() && it->second == button.get();
-                collapse = !host;
+                collapse = !host && !button->running;
             }
             ApplyButtonState(button.get(), host, collapse);
         });
@@ -4650,8 +4752,9 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
 }
 
 // Lets a left click on a folder reach the taskbar, so that the folder can be
-// dragged, and turns the resulting launch into the folder menu. Optional: if
-// the symbols can't be found, folders work but can't be dragged.
+// dragged, and turns the resulting launch (or, for a folder on an open app,
+// click) into the folder menu. Optional: if the symbols can't be found,
+// folders work but can't be dragged.
 void HookTaskbarSymbols() {
     HMODULE taskbarModule =
         LoadLibraryExW(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -4672,6 +4775,22 @@ void HookTaskbarSymbols() {
         taskbarModule, taskbarDllHooks, ARRAYSIZE(taskbarDllHooks));
     if (!g_launchHooked) {
         Wh_Log(L"Couldn't hook CTaskBand::Launch, folders can't be dragged");
+    }
+
+    // Hooked separately, so that each works without the other.
+    WindhawkUtils::SYMBOL_HOOK clickHooks[] = {
+        {
+            {LR"(protected: void __cdecl CTaskListWnd::_HandleClick(struct ITaskBtnGroup *,int,enum CTaskListWnd::eCLICKACTION,int,int))"},
+            &CTaskListWnd__HandleClick_Original,
+            CTaskListWnd__HandleClick_Hook,
+        },
+    };
+
+    g_clickHooked = WindhawkUtils::HookSymbols(taskbarModule, clickHooks,
+                                               ARRAYSIZE(clickHooks));
+    if (!g_clickHooked) {
+        Wh_Log(L"Couldn't hook CTaskListWnd::_HandleClick, a folder whose apps "
+               L"are all open can't be dragged");
     }
 }
 
