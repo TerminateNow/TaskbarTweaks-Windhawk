@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.11
+// @version         1.12
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -110,11 +110,14 @@ everything as one row, so the two groups are only kept a little apart.
 Turn on **Separator after pinned apps** as well to draw a `|` line at the end
 of the pinned apps and folders.
 
-Dragging still works the way it does without the option: drag pinned apps and
-folders to reorder them, and drag open apps to reorder those. The two groups
-are always kept apart, so a pinned app dragged among the open apps goes back
-to the end of the pinned apps when it's dropped. Dragging an open pinned app
-can also change its pinned spot, since it's the same taskbar icon.
+Drag pinned apps and folders to reorder them, as usual. A pinned app dragged
+among the open apps goes back to the end of the pinned apps when it's dropped.
+
+Open apps are dragged by the mod instead of by Windows: drag one to change its
+place among the open apps. This order is the mod's own, so it never changes
+where your pinned apps sit when they're closed. A newly opened app goes at
+the end of the open apps, and an app keeps its place for as long as it's
+open.
 
 ## Browsers with pinned web apps (PWAs)
 
@@ -145,11 +148,15 @@ pinned keeps its own taskbar icon while it's open.
   can't be dragged, and looks slightly different from real taskbar icons when
   hovered.
 * Keyboard shortcuts such as Win+1 still launch the app the folder sits on.
-* With **Keep open apps apart from pinned apps**, an open pinned app is only
-  drawn in the middle, so Windows may still open some things, such as its jump
-  list (right-click menu), at its pinned spot. While an app is being dragged,
-  the groups aren't rearranged until it's dropped. The option is ignored on a
-  taskbar laid out right to left.
+* With **Keep open apps apart from pinned apps**, an open app is only drawn in
+  its place among the open apps, so Windows may still open some things, such
+  as its jump list (right-click menu), where it would be without the option.
+  While a pinned app or folder is being dragged, the groups aren't rearranged
+  until it's dropped. The option is ignored on a taskbar laid out right to
+  left.
+* Dragging open apps relies on Windows' debugging symbols for the taskbar's
+  buttons. If those can't be found, Windows drags open apps itself, which
+  moves an open pinned app among the pinned apps.
 * Dragging the folder and opening its menu with a left click rely on Windows'
   debugging symbols for the taskbar, which Windhawk downloads the first time
   the mod loads. If that fails, the folder still opens its menu when clicked
@@ -483,6 +490,14 @@ struct ButtonState {
     bool marginOverridden = false;
     wux::Thickness baseMargin{};
     wux::Thickness appliedMargin{};
+    // The open app's place among the open apps (separateRunning), and the
+    // app it was given for. 0 when it isn't open.
+    uint64_t runningRank = 0;
+    std::wstring rankAppIdLower;
+    // Where the open app was last placed, in the repeater's coordinates.
+    double plannedLeft = 0;
+    bool zIndexRaised = false;
+    int originalZIndex = 0;
     bool transformOverridden = false;
     wux::Media::Transform originalTransform{nullptr};
     wux::Media::TranslateTransform translate{nullptr};
@@ -585,6 +600,38 @@ using CTaskBand_Launch_t = long(WINAPI*)(void* pThis,
                                          int options);
 CTaskBand_Launch_t CTaskBand_Launch_Original;
 bool g_launchHooked = false;
+
+// Open apps are dragged by the mod while they're kept apart from pinned apps
+// (separateRunning): the taskbar's own drag would move them among the pinned
+// apps, where they're laid out. These are the taskbar button's own pointer
+// handlers, in Taskbar.View.dll.
+using TaskListButton_OnPointer_t = int(WINAPI*)(void* pThis, void* pArgs);
+TaskListButton_OnPointer_t TaskListButton_OnPointerPressed_Original;
+TaskListButton_OnPointer_t TaskListButton_OnPointerMoved_Original;
+TaskListButton_OnPointer_t TaskListButton_OnPointerReleased_Original;
+TaskListButton_OnPointer_t TaskListButton_OnPointerCaptureLost_Original;
+std::atomic<bool> g_dragHooked = false;
+std::atomic<bool> g_taskbarViewHooksDone = false;
+
+// A left press on an open app, which becomes a drag once the pointer moves
+// far enough.
+struct RunningDrag {
+    bool armed = false;
+    bool dragging = false;
+    void* key = nullptr;
+    uint32_t pointerId = 0;
+    // The pointer's x when pressed and now, and where the app was placed when
+    // the drag started, in the repeater's coordinates.
+    double startX = 0;
+    double currentX = 0;
+    double startLeft = 0;
+};
+
+RunningDrag g_runningDrag;
+uint64_t g_lastRunningRank = 0;
+
+// How far the pointer has to move for a press on an open app to become a drag.
+constexpr double kDragThreshold = 6;
 
 // Apps seen with a closed taskbar button, which means they're pinned. A folder
 // whose apps are all open is only drawn in front of a pinned app.
@@ -3472,6 +3519,21 @@ void RestoreSectionTranslate(ButtonState* button,
     button->transformGroup = nullptr;
 }
 
+void RaiseDraggedButton(ButtonState* button, bool raise) {
+    auto element = button->element.get();
+    if (!element || raise == button->zIndexRaised) {
+        return;
+    }
+
+    if (raise) {
+        button->originalZIndex = wuxc::Canvas::GetZIndex(element);
+        wuxc::Canvas::SetZIndex(element, button->originalZIndex + 100);
+    } else {
+        wuxc::Canvas::SetZIndex(element, button->originalZIndex);
+    }
+    button->zIndexRaised = raise;
+}
+
 // Undoes the margin and transform set for keeping open apps apart.
 void RestoreSectionLayout(ButtonState* button) {
     auto element = button->element.get();
@@ -3485,6 +3547,7 @@ void RestoreSectionLayout(ButtonState* button) {
     button->marginOverridden = false;
 
     Guarded([&] { RestoreSectionTranslate(button, element); });
+    Guarded([&] { RaiseDraggedButton(button, false); });
 }
 
 std::optional<int> GetRepeaterElementIndex(
@@ -3924,6 +3987,109 @@ void ClearRowLayout(SectionsTaskbar& taskbar,
     PruneDrawnFolders(taskbar);
 }
 
+// The open apps (indexes into items) in the mod's order. An app gets its
+// place when it's first seen open, after the open apps before it, so a newly
+// opened app goes last. Places are kept per button, for as long as its app
+// stays open.
+std::vector<int> OrderRunningItems(std::vector<SectionItem> const& items,
+                                   std::vector<int> const& running) {
+    for (auto& item : items) {
+        if (!item.button->running) {
+            item.button->runningRank = 0;
+        }
+    }
+
+    for (int i : running) {
+        ButtonState* button = items[i].button;
+        if (!button->runningRank ||
+            button->rankAppIdLower != button->appIdLower) {
+            button->runningRank = ++g_lastRunningRank;
+            button->rankAppIdLower = button->appIdLower;
+        }
+    }
+
+    std::vector<int> order = running;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return items[a].button->runningRank < items[b].button->runningRank;
+    });
+    return order;
+}
+
+// The left edge of each open app in order, from groupStart. While one is
+// dragged, it follows the pointer, and it changes places with the apps it
+// passes the middle of. The new order is kept.
+std::vector<double> ApplyRunningDrag(std::vector<SectionItem> const& items,
+                                     std::vector<int>& order,
+                                     double groupStart) {
+    auto layOut = [&] {
+        std::vector<double> lefts;
+        double cursor = groupStart;
+        for (int i : order) {
+            lefts.push_back(cursor + items[i].base.Left);
+            cursor += items[i].extent;
+        }
+        return lefts;
+    };
+
+    int dragged = -1;
+    if (g_runningDrag.dragging) {
+        for (size_t k = 0; k < order.size(); k++) {
+            if (items[order[k]].button->key == g_runningDrag.key) {
+                dragged = static_cast<int>(k);
+                break;
+            }
+        }
+    }
+    if (dragged < 0) {
+        return layOut();
+    }
+
+    auto& item = items[order[dragged]];
+    double groupWidth = 0;
+    for (int i : order) {
+        groupWidth += items[i].extent;
+    }
+    double left = g_runningDrag.startLeft +
+                  (g_runningDrag.currentX - g_runningDrag.startX);
+    left = std::clamp(left, groupStart + item.base.Left,
+                      groupStart + groupWidth - item.extent + item.base.Left);
+    double center = left + item.width / 2;
+
+    // The dragged app's new place: after every other app whose middle it's
+    // past, with the others laid out where they are now.
+    std::vector<double> lefts = layOut();
+    int target = 0;
+    for (size_t k = 0; k < order.size(); k++) {
+        if (static_cast<int>(k) == dragged) {
+            continue;
+        }
+        if (lefts[k] + items[order[k]].width / 2 < center) {
+            target++;
+        }
+    }
+
+    if (target != dragged) {
+        // Keep the same set of places, handed out in the new order.
+        std::vector<uint64_t> ranks;
+        for (int i : order) {
+            ranks.push_back(items[i].button->runningRank);
+        }
+        std::sort(ranks.begin(), ranks.end());
+
+        int moved = order[dragged];
+        order.erase(order.begin() + dragged);
+        order.insert(order.begin() + target, moved);
+        for (size_t k = 0; k < order.size(); k++) {
+            items[order[k]].button->runningRank = ranks[k];
+        }
+        lefts = layOut();
+        dragged = target;
+    }
+
+    lefts[dragged] = left;
+    return lefts;
+}
+
 void ArrangeSections(SectionsTaskbar& taskbar) {
     if (g_unloading || g_arrangingSections) {
         return;
@@ -3964,7 +4130,11 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
             continue;
         }
 
-        if (IsPointerHeld(button.get())) {
+        // The taskbar's own drag reorders the row live. Open apps are dragged
+        // by the mod instead while they're kept apart from pinned apps.
+        if (IsPointerHeld(button.get()) &&
+            !(button->running && g_settings.separateRunning &&
+              g_dragHooked)) {
             frozen = true;
         }
 
@@ -4073,11 +4243,11 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
     // of carriers. Every open app goes in the middle.
     int pinnedEnd = -1;
     double runningWidth = 0;
-    bool anyRunning = false;
+    std::vector<int> running;
     for (int i = 0; i < count; i++) {
         if (items[i].button->running) {
             runningWidth += items[i].extent;
-            anyRunning = true;
+            running.push_back(i);
         }
         if (!items[i].button->running || items[i].button->carriesFolder) {
             pinnedEnd = i;
@@ -4109,67 +4279,100 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
     double runningStart =
         std::min(centerX - runningWidth / 2, limitX - runningWidth);
 
+    // Where the open apps start (groupStart), and where the ones after the
+    // pinned section are laid out by the taskbar (naturalStart).
+    double groupStart = 0;
+    double naturalStart = 0;
     if (pinnedEnd < 0) {
         // Only open apps: the first one moves the group to the middle.
-        if (anyRunning) {
-            extraLeft[0] = std::max(
-                0.0, std::round(runningStart - items[0].slotStart));
+        if (running.empty()) {
+            HideSeparator(taskbar);
+            finish();
+            return;
         }
+        extraLeft[0] =
+            std::max(0.0, std::round(runningStart - items[0].slotStart));
+        groupStart = items[0].slotStart + extraLeft[0];
+        naturalStart = groupStart;
         HideSeparator(taskbar);
-        finish();
-        return;
-    }
-
-    auto& end = items[pinnedEnd];
-    // The end of its space without the mod's right margin: a closed app's
-    // button, or a carrier's folder space.
-    double pinnedRight =
-        end.slotStart + (end.button->carriesFolder ? extraLeft[pinnedEnd] : 0) +
-        (end.button->running ? 0 : end.extent);
-
-    if (!taskbar.loggedCentered && originX > rootWidth / 5) {
-        taskbar.loggedCentered = true;
-        Wh_Log(L"The taskbar looks center-aligned. For pinned apps to sit at "
-               L"the left edge, set Taskbar alignment to Left");
-    }
-
-    double minGap = g_settings.pinnedSeparator
-                        ? kSeparatorPadding * 2 + kSeparatorWidth
-                        : kMinSectionGap;
-    double gap = 0;
-    if (anyRunning) {
-        gap = std::max(std::round(runningStart - pinnedRight), minGap);
-    } else if (g_settings.pinnedSeparator) {
-        gap = minGap;
-    }
-
-    // Open apps up to the end of the pinned section are drawn in order at the
-    // start of the open apps, in space reserved by the margin after the
-    // pinned section. A negative right margin as wide as the button with its
-    // own margin makes each take no space in the row.
-    double cursor = pinnedRight + gap;
-    double movedWidth = 0;
-    for (int i = 0; i <= pinnedEnd; i++) {
-        auto& item = items[i];
-        if (!item.button->running) {
-            continue;
-        }
-
-        extraRight[i] = -item.extent;
-        // Where the button is laid out once its margins are applied.
-        double laidOutX = item.slotStart + item.base.Left + extraLeft[i];
-        translate[i] = cursor + item.base.Left - laidOutX;
-        cursor += item.extent;
-        movedWidth += item.extent;
-    }
-
-    extraRight[pinnedEnd] += gap + movedWidth;
-
-    if (g_settings.pinnedSeparator) {
-        PlaceSeparator(taskbar, repeater, end,
-                       pinnedRight + kSeparatorPadding);
     } else {
-        HideSeparator(taskbar);
+        auto& end = items[pinnedEnd];
+        // The end of its space without the mod's right margin: a closed app's
+        // button, or a carrier's folder space.
+        double pinnedRight = end.slotStart +
+                             (end.button->carriesFolder ? extraLeft[pinnedEnd]
+                                                        : 0) +
+                             (end.button->running ? 0 : end.extent);
+
+        if (!taskbar.loggedCentered && originX > rootWidth / 5) {
+            taskbar.loggedCentered = true;
+            Wh_Log(L"The taskbar looks center-aligned. For pinned apps to sit "
+                   L"at the left edge, set Taskbar alignment to Left");
+        }
+
+        double minGap = g_settings.pinnedSeparator
+                            ? kSeparatorPadding * 2 + kSeparatorWidth
+                            : kMinSectionGap;
+        double gap = 0;
+        if (!running.empty()) {
+            gap = std::max(std::round(runningStart - pinnedRight), minGap);
+        } else if (g_settings.pinnedSeparator) {
+            gap = minGap;
+        }
+
+        // Open apps up to the end of the pinned section (open pinned apps and
+        // carriers) take no space there: a negative right margin as wide as
+        // the button with its own margin. Their space is reserved by the
+        // margin after the pinned section instead, in front of the open apps
+        // that the taskbar lays out after it.
+        double movedWidth = 0;
+        for (int i : running) {
+            if (i <= pinnedEnd) {
+                extraRight[i] = -items[i].extent;
+                movedWidth += items[i].extent;
+            }
+        }
+        extraRight[pinnedEnd] += gap + movedWidth;
+
+        groupStart = pinnedRight + gap;
+        naturalStart = groupStart + movedWidth;
+
+        if (g_settings.pinnedSeparator) {
+            PlaceSeparator(taskbar, repeater, end,
+                           pinnedRight + kSeparatorPadding);
+        } else {
+            HideSeparator(taskbar);
+        }
+    }
+
+    // Where the taskbar lays out each open app once the margins are applied:
+    // the ones up to the pinned section where their space starts, the others
+    // one after another from naturalStart.
+    std::vector<double> natural(count, 0);
+    double laidOut = naturalStart;
+    for (int i : running) {
+        auto& item = items[i];
+        if (i <= pinnedEnd) {
+            natural[i] = item.slotStart + item.base.Left + extraLeft[i];
+        } else {
+            natural[i] = laidOut + item.base.Left;
+            laidOut += item.extent;
+        }
+    }
+
+    // The open apps are shown in the mod's own order: by when they were first
+    // seen open, rearranged by dragging. Each is moved from where the taskbar
+    // lays it out to its place in that order.
+    std::vector<int> order = OrderRunningItems(items, running);
+    std::vector<double> lefts = ApplyRunningDrag(items, order, groupStart);
+
+    for (size_t k = 0; k < order.size(); k++) {
+        int i = order[k];
+        items[i].button->plannedLeft = lefts[k];
+        translate[i] = lefts[k] - natural[i];
+        if (std::abs(*translate[i]) < 0.25) {
+            translate[i] = std::nullopt;
+        }
     }
 
     finish();
@@ -4257,6 +4460,203 @@ void ArrangeAllSections() {
     for (auto& taskbar : g_sectionsTaskbars) {
         Guarded([&] { ArrangeSections(*taskbar); });
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Dragging open apps (separateRunning)
+//
+// The taskbar lays out an open pinned app at its pinned spot, and the mod only
+// shows it among the open apps. The taskbar's own drag would reorder it among
+// the pinned apps, so presses on open apps are watched in the taskbar button's
+// own pointer handlers: once the pointer moves, the taskbar doesn't see the
+// moves, and the mod moves the button and reorders the open apps itself
+// (ApplyRunningDrag). A press that doesn't move is left to the taskbar, so
+// clicks work as usual.
+
+ButtonState* ButtonFromTaskListButton(void* pThis) {
+    wux::UIElement element{nullptr};
+    reinterpret_cast<IUnknown*>(pThis)->QueryInterface(
+        winrt::guid_of<wux::UIElement>(), winrt::put_abi(element));
+    return element ? FindButton(CanonicalPtr(element)) : nullptr;
+}
+
+wux::Input::PointerRoutedEventArgs PointerArgs(void* pArgs) {
+    wux::Input::PointerRoutedEventArgs args{nullptr};
+    reinterpret_cast<IUnknown*>(pArgs)->QueryInterface(
+        winrt::guid_of<wux::Input::PointerRoutedEventArgs>(),
+        winrt::put_abi(args));
+    return args;
+}
+
+wux::FrameworkElement DragRepeater(ButtonState* button) {
+    SectionsTaskbar* taskbar =
+        button->repeaterKey ? FindSectionsTaskbar(button->repeaterKey)
+                            : nullptr;
+    return taskbar ? taskbar->repeater.get() : nullptr;
+}
+
+// Ends a drag: the app settles into its new place. Pointer capture is only
+// released when asked, since the end can come from losing it.
+void EndRunningDrag(bool releaseCapture) {
+    RunningDrag drag = g_runningDrag;
+    g_runningDrag = RunningDrag{};
+
+    ButtonState* button = FindButton(drag.key);
+    if (!button || !drag.dragging) {
+        return;
+    }
+
+    Wh_Log(L"Dropped %s", button->appId.c_str());
+    RaiseDraggedButton(button, false);
+    if (releaseCapture) {
+        if (auto element = button->element.get()) {
+            // Also ends the taskbar's own press, without a click.
+            element.ReleasePointerCaptures();
+        }
+    }
+
+    if (SectionsTaskbar* taskbar =
+            button->repeaterKey ? FindSectionsTaskbar(button->repeaterKey)
+                                : nullptr) {
+        ArrangeSections(*taskbar);
+    }
+    ScheduleUpdate();
+}
+
+void OnTaskListButtonPressed(void* pThis, void* pArgs) {
+    if (g_runningDrag.dragging) {
+        return;
+    }
+    g_runningDrag = RunningDrag{};
+
+    if (g_unloading || !g_settings.separateRunning) {
+        return;
+    }
+
+    ButtonState* button = ButtonFromTaskListButton(pThis);
+    if (!button || !button->running) {
+        return;
+    }
+
+    auto element = button->element.get();
+    auto repeater = DragRepeater(button);
+    auto args = PointerArgs(pArgs);
+    if (!element || !repeater || !args) {
+        return;
+    }
+
+    auto point = args.GetCurrentPoint(repeater);
+    auto properties = point.Properties();
+    if (!properties.IsLeftButtonPressed() || properties.IsRightButtonPressed() ||
+        properties.IsMiddleButtonPressed()) {
+        return;
+    }
+
+    g_runningDrag.armed = true;
+    g_runningDrag.key = button->key;
+    g_runningDrag.pointerId = args.Pointer().PointerId();
+    g_runningDrag.startX = point.Position().X;
+    g_runningDrag.currentX = g_runningDrag.startX;
+}
+
+// Returns whether the move was taken from the taskbar.
+bool OnTaskListButtonMoved(void* pArgs) {
+    auto args = PointerArgs(pArgs);
+    if (!args || args.Pointer().PointerId() != g_runningDrag.pointerId) {
+        return false;
+    }
+
+    ButtonState* button = FindButton(g_runningDrag.key);
+    auto element = button ? button->element.get() : nullptr;
+    auto repeater = button ? DragRepeater(button) : nullptr;
+    if (!element || !repeater) {
+        g_runningDrag = RunningDrag{};
+        return false;
+    }
+
+    auto point = args.GetCurrentPoint(repeater);
+    if (!point.Properties().IsLeftButtonPressed()) {
+        EndRunningDrag(true);
+        return false;
+    }
+
+    g_runningDrag.currentX = point.Position().X;
+    if (!g_runningDrag.dragging) {
+        // Small moves are kept from the taskbar too, so that its own drag
+        // doesn't start.
+        if (std::abs(g_runningDrag.currentX - g_runningDrag.startX) <
+            kDragThreshold) {
+            return true;
+        }
+
+        Wh_Log(L"Dragging %s", button->appId.c_str());
+        g_runningDrag.dragging = true;
+        g_runningDrag.startLeft = button->plannedLeft;
+        element.CapturePointer(args.Pointer());
+        RaiseDraggedButton(button, true);
+    }
+
+    args.Handled(true);
+    if (SectionsTaskbar* taskbar = FindSectionsTaskbar(button->repeaterKey)) {
+        ArrangeSections(*taskbar);
+    }
+    return true;
+}
+
+int WINAPI TaskListButton_OnPointerPressed_Hook(void* pThis, void* pArgs) {
+    int result = TaskListButton_OnPointerPressed_Original(pThis, pArgs);
+    Guarded([&] { OnTaskListButtonPressed(pThis, pArgs); });
+    return result;
+}
+
+int WINAPI TaskListButton_OnPointerMoved_Hook(void* pThis, void* pArgs) {
+    if (g_runningDrag.armed) {
+        bool taken = false;
+        Guarded([&] { taken = OnTaskListButtonMoved(pArgs); });
+        if (taken) {
+            return S_OK;
+        }
+    }
+    return TaskListButton_OnPointerMoved_Original(pThis, pArgs);
+}
+
+int WINAPI TaskListButton_OnPointerReleased_Hook(void* pThis, void* pArgs) {
+    if (g_runningDrag.armed) {
+        bool dropped = false;
+        Guarded([&] {
+            auto args = PointerArgs(pArgs);
+            if (!args ||
+                args.Pointer().PointerId() != g_runningDrag.pointerId) {
+                return;
+            }
+            if (!g_runningDrag.dragging) {
+                // A click.
+                g_runningDrag = RunningDrag{};
+                return;
+            }
+            // A drop: the taskbar doesn't get the release, so it isn't
+            // taken as a click.
+            args.Handled(true);
+            dropped = true;
+            EndRunningDrag(true);
+        });
+        if (dropped) {
+            return S_OK;
+        }
+    }
+    return TaskListButton_OnPointerReleased_Original(pThis, pArgs);
+}
+
+int WINAPI TaskListButton_OnPointerCaptureLost_Hook(void* pThis, void* pArgs) {
+    if (g_runningDrag.armed) {
+        Guarded([&] {
+            ButtonState* button = ButtonFromTaskListButton(pThis);
+            if (button && button->key == g_runningDrag.key) {
+                EndRunningDrag(false);
+            }
+        });
+    }
+    return TaskListButton_OnPointerCaptureLost_Original(pThis, pArgs);
 }
 
 // Restores everything the mod changed on the button and removes its handlers.
@@ -4656,6 +5056,7 @@ void InitializeForCurrentThread() {
 
 void UninitializeForCurrentThread() {
     Guarded([] { HideFolderMenu(); });
+    g_runningDrag = RunningDrag{};
     Guarded([] { TearDownSections(); });
 
     for (auto& button : g_buttons) {
@@ -5075,6 +5476,70 @@ void HookTaskbarSymbols() {
     }
 }
 
+// The taskbar button's own pointer handlers, for dragging open apps. Optional:
+// without them, open apps are dragged by the taskbar.
+bool HookTaskbarViewSymbols(HMODULE module) {
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskListButton,struct winrt::Windows::UI::Xaml::Controls::IControlOverrides>::OnPointerPressed(void *))"},
+            &TaskListButton_OnPointerPressed_Original,
+            TaskListButton_OnPointerPressed_Hook,
+        },
+        {
+            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskListButton,struct winrt::Windows::UI::Xaml::Controls::IControlOverrides>::OnPointerMoved(void *))"},
+            &TaskListButton_OnPointerMoved_Original,
+            TaskListButton_OnPointerMoved_Hook,
+        },
+        {
+            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskListButton,struct winrt::Windows::UI::Xaml::Controls::IControlOverrides>::OnPointerReleased(void *))"},
+            &TaskListButton_OnPointerReleased_Original,
+            TaskListButton_OnPointerReleased_Hook,
+        },
+        {
+            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskListButton,struct winrt::Windows::UI::Xaml::Controls::IControlOverrides>::OnPointerCaptureLost(void *))"},
+            &TaskListButton_OnPointerCaptureLost_Original,
+            TaskListButton_OnPointerCaptureLost_Hook,
+        },
+    };
+
+    return WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks));
+}
+
+HMODULE GetTaskbarViewModuleHandle() {
+    HMODULE module = GetModuleHandleW(L"Taskbar.View.dll");
+    if (!module) {
+        module = GetModuleHandleW(L"ExplorerExtensions.dll");
+    }
+    return module;
+}
+
+void HandleTaskbarViewModule(HMODULE module, bool applyNow) {
+    if (g_taskbarViewHooksDone.exchange(true)) {
+        return;
+    }
+
+    g_dragHooked = HookTaskbarViewSymbols(module);
+    if (!g_dragHooked) {
+        Wh_Log(L"Couldn't hook the taskbar button's pointer handlers, open "
+               L"apps are dragged by the taskbar");
+    } else if (applyNow) {
+        Wh_ApplyHookOperations();
+    }
+}
+
+using LoadLibraryExW_t = decltype(&LoadLibraryExW);
+LoadLibraryExW_t LoadLibraryExW_Original;
+HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
+                                   HANDLE hFile,
+                                   DWORD dwFlags) {
+    HMODULE module = LoadLibraryExW_Original(lpLibFileName, hFile, dwFlags);
+    if (module && !g_taskbarViewHooksDone &&
+        module == GetTaskbarViewModuleHandle()) {
+        HandleTaskbarViewModule(module, true);
+    }
+    return module;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Mod entry points
 
@@ -5090,11 +5555,29 @@ BOOL Wh_ModInit() {
 
     HookTaskbarSymbols();
 
+    if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
+        HandleTaskbarViewModule(taskbarViewModule, false);
+    } else {
+        HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+        auto loadLibraryExW = reinterpret_cast<LoadLibraryExW_t>(
+            GetProcAddress(kernelBase, "LoadLibraryExW"));
+        if (loadLibraryExW) {
+            WindhawkUtils::SetFunctionHook(loadLibraryExW, LoadLibraryExW_Hook,
+                                           &LoadLibraryExW_Original);
+        }
+    }
+
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
     Wh_Log(L">");
+
+    if (!g_taskbarViewHooksDone) {
+        if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
+            HandleTaskbarViewModule(taskbarViewModule, true);
+        }
+    }
 
     HWND taskbarUiWnd = GetTaskbarUiWnd();
     if (!taskbarUiWnd) {

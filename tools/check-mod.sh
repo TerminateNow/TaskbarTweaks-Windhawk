@@ -56,6 +56,7 @@ void Wh_FreeStringSetting(const wchar_t* value);
 size_t Wh_GetStringValue(const wchar_t* name, wchar_t* buffer, size_t chars);
 BOOL Wh_SetStringValue(const wchar_t* name, const wchar_t* value);
 BOOL Wh_SetFunctionHook(void* target, void* hook, void** original);
+void Wh_ApplyHookOperations(void);
 #ifdef __cplusplus
 }
 #endif
@@ -111,6 +112,7 @@ size_t Wh_GetStringValue(const wchar_t* name, wchar_t* buffer, size_t chars) {
 }
 BOOL Wh_SetStringValue(const wchar_t* name, const wchar_t* value) { return TRUE; }
 BOOL Wh_SetFunctionHook(void* target, void* hook, void** original) { return TRUE; }
+void Wh_ApplyHookOperations(void) {}
 EOF
 
 # Link with the libraries the mod asks for in @compilerOptions.
