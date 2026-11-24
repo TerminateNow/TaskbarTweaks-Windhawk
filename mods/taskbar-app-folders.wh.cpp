@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.12
+// @version         1.13
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -54,7 +54,11 @@ listed in more than one folder, the first folder wins.
   with one app), the folder stays on the taskbar right in front of its first
   app, and each open app keeps its own taskbar icon. Click the folder to open
   its menu as usual.
-* Clicking the folder opens its menu. Click an app to open it.
+* Hover over a folder to see all of its apps. The open ones are listed first,
+  with a line between them and the rest.
+* Clicking the folder opens its menu. Click an app to open it. With **Group
+  open apps in the folder menu** (on by default), the menu also lists the open
+  apps first, with a line after them.
 * Drag the folder to move it, like any other pinned icon. This moves the app
   the folder sits on, so the folder stays in its new spot.
 * Click ❌ next to an app to take it out of the folder and put it back on the
@@ -212,6 +216,11 @@ Any of those values can be used in the folder's app list. Lines like
   $options:
   - modern: Modern (Windows 11 style)
   - classic: Classic context menu
+- groupOpenApps: true
+  $name: Group open apps in the folder menu
+  $description: >-
+    List a folder's open apps first in its menu, with a line between them and
+    the rest of its apps.
 - separateRunning: false
   $name: Keep open apps apart from pinned apps
   $description: >-
@@ -400,6 +409,8 @@ struct Settings {
     std::wstring iconFolder;
     std::wstring defaultIcon;
     bool classicMenu = false;
+    // Open apps first in the folder menu, with a separator after them.
+    bool groupOpenApps = true;
     // Apps listed under Apps with PWAs, normalized like FolderConfig::matchKeys.
     std::vector<std::wstring> pwaMatchKeys;
     // PWA mode behavior: true for "Show as open, Close ends all".
@@ -411,6 +422,16 @@ struct Settings {
 };
 
 Settings g_settings;
+
+// Set while folder entries are collected for a tooltip, which happens on every
+// hover, so that they aren't logged each time.
+bool g_quietMenuLog = false;
+#define MENU_LOG(...)                \
+    do {                             \
+        if (!g_quietMenuLog) {       \
+            Wh_Log(__VA_ARGS__);     \
+        }                            \
+    } while (0)
 
 // Apps removed from a folder with the ❌ button, keyed by FolderConfig::key.
 // Each removal is a group of app IDs: the app's own, then those of its other
@@ -482,6 +503,16 @@ struct ButtonState {
     bool iconOverridden = false;
     bool applyingIcon = false;
     wux::Media::ImageSource originalIcon{nullptr};
+
+    // A host's tooltip lists the folder's apps: the taskbar's own tooltip,
+    // whose content is replaced when it opens, or one the mod set if the
+    // button had none (ownToolTipSet, with the button's tooltip value kept).
+    winrt::weak_ref<wuxc::ToolTip> hostToolTip;
+    winrt::event_token hostToolTipOpenedToken{};
+    wf::IInspectable originalToolTipContent{nullptr};
+    wf::IInspectable folderToolTipContent{nullptr};
+    bool ownToolTipSet = false;
+    wf::IInspectable originalToolTip{nullptr};
 
     // Open apps kept apart from pinned apps. The repeater the button is laid
     // out in, the margin the mod set on top of the button's own (baseMargin),
@@ -808,6 +839,7 @@ Settings LoadSettings() {
     settings.iconFolder = StripQuotes(GetStringSetting(L"iconFolder"));
     settings.defaultIcon = Trim(GetStringSetting(L"defaultIcon"));
     settings.classicMenu = GetStringSetting(L"menuStyle") == L"classic";
+    settings.groupOpenApps = Wh_GetIntSetting(L"groupOpenApps") != 0;
 
     for (int i = 0; i < kMaxAppsPerFolder; i++) {
         std::wstring app = Trim(GetStringSetting(L"pwaApps[%d]", i));
@@ -1877,7 +1909,7 @@ void LogProgramWindow(const OpenWindow& window) {
     GetWindowTextW(window.hWnd, title, ARRAYSIZE(title));
     DWORD cloak = 0;
     DwmGetWindowAttribute(window.hWnd, DWMWA_CLOAKED, &cloak, sizeof(cloak));
-    Wh_Log(L"  window %p: class '%s', title '%s', app ID '%s', cloak %u",
+    MENU_LOG(L"  window %p: class '%s', title '%s', app ID '%s', cloak %u",
            window.hWnd, className, title, window.appIdLower.c_str(), cloak);
 }
 
@@ -1987,16 +2019,16 @@ void CountOpenWindows(MenuEntry& entry,
     } else if (g_settings.pwaCloseAll) {
         entry.backgroundExe = exe;
         entry.closeEndsOtherApps = true;
-        Wh_Log(L"%s is only running for its PWAs: Close ends them too",
+        MENU_LOG(L"%s is only running for its PWAs: Close ends them too",
                entry.appId.c_str());
     } else {
         entry.running = false;
-        Wh_Log(L"%s is only running for its PWAs: shown as closed",
+        MENU_LOG(L"%s is only running for its PWAs: shown as closed",
                entry.appId.c_str());
     }
 
     if (noCloseReason) {
-        Wh_Log(L"%s runs without windows of its own, but can't be closed "
+        MENU_LOG(L"%s runs without windows of its own, but can't be closed "
                L"from the menu: %s",
                entry.appId.c_str(), noCloseReason);
         if (blocking) {
@@ -2223,12 +2255,12 @@ std::vector<MenuEntry> CollectMenuEntries(ButtonState* host) {
 
     for (size_t i = 0; i < entries.size(); i++) {
         CountOpenWindows(entries[i], entryExes[i], snapshot);
-        Wh_Log(L"Menu entry %s: order %d, %s, %d windows, %zu other app IDs",
+        MENU_LOG(L"Menu entry %s: order %d, %s, %d windows, %zu other app IDs",
                entries[i].appId.c_str(), entryOrders[i],
                entries[i].running ? L"open" : L"closed",
                entries[i].windowCount, entries[i].aliasAppIds.size());
         for (const auto& alias : entries[i].aliasAppIds) {
-            Wh_Log(L"  also %s", alias.c_str());
+            MENU_LOG(L"  also %s", alias.c_str());
         }
     }
 
@@ -2571,6 +2603,15 @@ wux::Media::SolidColorBrush TransparentBrush() {
     return wux::Media::SolidColorBrush(winrt::Windows::UI::Color{0, 0, 0, 0});
 }
 
+wuxc::Border MenuSeparator() {
+    wuxc::Border separator;
+    separator.Height(1);
+    separator.Margin(wux::Thickness{8, 6, 8, 6});
+    separator.Background(wux::Media::SolidColorBrush(
+        winrt::Windows::UI::Color{0x40, 0x80, 0x80, 0x80}));
+    return separator;
+}
+
 void ShowModernMenu(wux::FrameworkElement const& anchor,
                     int folder,
                     const std::vector<MenuEntry>& entries,
@@ -2589,8 +2630,15 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
     title.TextTrimming(wux::TextTrimming::CharacterEllipsis);
     panel.Children().Append(title);
 
-    for (const auto& entry : entries) {
+    for (size_t entryIndex = 0; entryIndex < entries.size(); entryIndex++) {
+        const auto& entry = entries[entryIndex];
         std::wstring appId = entry.appId;
+
+        // Between the open apps, listed first, and the rest.
+        if (g_settings.groupOpenApps && entryIndex > 0 && !entry.running &&
+            entries[entryIndex - 1].running) {
+            panel.Children().Append(MenuSeparator());
+        }
 
         wuxc::Grid row;
         wuxc::ColumnDefinition nameColumn;
@@ -2713,12 +2761,7 @@ void ShowModernMenu(wux::FrameworkElement const& anchor,
     }
 
     if (!removed.empty()) {
-        wuxc::Border separator;
-        separator.Height(1);
-        separator.Margin(wux::Thickness{8, 6, 8, 6});
-        separator.Background(wux::Media::SolidColorBrush(
-            winrt::Windows::UI::Color{0x40, 0x80, 0x80, 0x80}));
-        panel.Children().Append(separator);
+        panel.Children().Append(MenuSeparator());
 
         wuxc::Grid captionRow;
         wuxc::ColumnDefinition captionColumn;
@@ -2885,6 +2928,11 @@ void ShowClassicMenuNow() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     for (size_t i = 0; i < pending.entries.size(); i++) {
+        if (g_settings.groupOpenApps && i > 0 && !pending.entries[i].running &&
+            pending.entries[i - 1].running) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+
         UINT id = kCmdLaunchBase + static_cast<UINT>(i);
         std::wstring text = pending.entries[i].name;
         if (pending.entries[i].running) {
@@ -2981,6 +3029,13 @@ void ShowFolderMenu(ButtonState* host,
         return;
     }
 
+    if (g_settings.groupOpenApps) {
+        std::stable_partition(entries.begin(), entries.end(),
+                              [](MenuEntry const& entry) {
+                                  return entry.running;
+                              });
+    }
+
     auto removed = GetRemovedEntries(host->folder);
 
     if (g_settings.classicMenu) {
@@ -2996,6 +3051,182 @@ void ShowFolderMenu(ButtonState* host,
         g_menuFlyout = nullptr;
         QueueClassicMenu(host->folder, std::move(entries), std::move(removed));
     }
+}
+
+void RestoreHostToolTip(ButtonState* button);
+
+// The content of a folder's tooltip: its name and all its apps, the open
+// ones first with a line after them. Built each time the tooltip opens, from
+// the same entries as the folder menu.
+wux::UIElement BuildFolderToolTipContent(ButtonState* host) {
+    std::vector<MenuEntry> entries;
+    g_quietMenuLog = true;
+    try {
+        entries = CollectMenuEntries(host);
+    } catch (...) {
+        g_quietMenuLog = false;
+        throw;
+    }
+    g_quietMenuLog = false;
+
+    std::stable_partition(
+        entries.begin(), entries.end(),
+        [](MenuEntry const& entry) { return entry.running; });
+
+    wuxc::StackPanel panel;
+    panel.Spacing(4);
+
+    wuxc::TextBlock title;
+    title.Text(winrt::hstring(FolderDisplayName(host->folder)));
+    title.FontWeight(winrt::Windows::UI::Text::FontWeight{600});
+    panel.Children().Append(title);
+
+    constexpr size_t kMaxToolTipEntries = 30;
+    for (size_t i = 0; i < entries.size() && i < kMaxToolTipEntries; i++) {
+        const auto& entry = entries[i];
+
+        if (i > 0 && !entry.running && entries[i - 1].running) {
+            wuxc::Border separator;
+            separator.Height(1);
+            separator.Margin(wux::Thickness{0, 2, 0, 2});
+            separator.Background(wux::Media::SolidColorBrush(
+                winrt::Windows::UI::Color{0x60, 0x80, 0x80, 0x80}));
+            panel.Children().Append(separator);
+        }
+
+        wuxc::StackPanel row;
+        row.Orientation(wuxc::Orientation::Horizontal);
+        row.Spacing(8);
+
+        if (auto icon = GetAppIcon(entry.appId)) {
+            wuxc::Image image;
+            image.Source(icon);
+            image.Width(16);
+            image.Height(16);
+            row.Children().Append(image);
+        }
+
+        wuxc::TextBlock name;
+        name.Text(winrt::hstring(entry.name));
+        name.VerticalAlignment(wux::VerticalAlignment::Center);
+        row.Children().Append(name);
+
+        if (entry.running) {
+            wuxc::TextBlock openLabel;
+            openLabel.Text(winrt::hstring(OpenLabel(entry)));
+            openLabel.FontSize(11);
+            openLabel.Opacity(0.6);
+            openLabel.VerticalAlignment(wux::VerticalAlignment::Center);
+            row.Children().Append(openLabel);
+        }
+
+        panel.Children().Append(row);
+    }
+
+    if (entries.size() > kMaxToolTipEntries) {
+        wuxc::TextBlock more;
+        more.Text(winrt::hstring(
+            L"+" + std::to_wstring(entries.size() - kMaxToolTipEntries) +
+            L" more"));
+        more.Opacity(0.6);
+        panel.Children().Append(more);
+    }
+
+    return panel;
+}
+
+void OnHostToolTipOpened(void* key, wf::IInspectable const& sender) {
+    ButtonState* button = FindButton(key);
+    if (!button || !button->isHost) {
+        return;
+    }
+
+    auto toolTip = sender.as<wuxc::ToolTip>();
+    auto content = toolTip.Content();
+    // Whatever the taskbar put in since is what goes back later.
+    if (!button->folderToolTipContent || !content ||
+        CanonicalPtr(content) != CanonicalPtr(button->folderToolTipContent)) {
+        button->originalToolTipContent = content;
+    }
+
+    auto folderContent = BuildFolderToolTipContent(button);
+    button->folderToolTipContent = folderContent;
+    toolTip.Content(folderContent);
+}
+
+// Makes a host's tooltip list its folder's apps. Called on every update, and
+// does nothing while that's already set up.
+void ApplyHostToolTip(ButtonState* button,
+                      wux::FrameworkElement const& element) {
+    auto current = wuxc::ToolTipService::GetToolTip(element);
+    auto toolTip = current ? current.try_as<wuxc::ToolTip>() : nullptr;
+
+    auto applied = button->hostToolTip.get();
+    if (applied && toolTip &&
+        CanonicalPtr(applied) == CanonicalPtr(toolTip)) {
+        return;
+    }
+
+    // The taskbar replaced its tooltip since.
+    if (applied) {
+        RestoreHostToolTip(button);
+        current = wuxc::ToolTipService::GetToolTip(element);
+        toolTip = current ? current.try_as<wuxc::ToolTip>() : nullptr;
+    }
+
+    if (!toolTip) {
+        // No tooltip object to fill in: the mod sets its own.
+        button->originalToolTip = current;
+        toolTip = wuxc::ToolTip();
+        toolTip.Content(
+            winrt::box_value(winrt::hstring(FolderDisplayName(button->folder))));
+        wuxc::ToolTipService::SetToolTip(element, toolTip);
+        button->ownToolTipSet = true;
+    }
+
+    void* key = button->key;
+    button->hostToolTip = winrt::make_weak(toolTip);
+    button->hostToolTipOpenedToken = toolTip.Opened(
+        [key](wf::IInspectable const& sender, auto const&) {
+            Guarded([&] { OnHostToolTipOpened(key, sender); });
+        });
+}
+
+// Puts the taskbar's tooltip back as it was.
+void RestoreHostToolTip(ButtonState* button) {
+    Guarded([&] {
+        auto toolTip = button->hostToolTip.get();
+        if (!toolTip) {
+            return;
+        }
+
+        if (button->hostToolTipOpenedToken) {
+            toolTip.Opened(button->hostToolTipOpenedToken);
+        }
+
+        auto content = toolTip.Content();
+        if (button->folderToolTipContent && content &&
+            CanonicalPtr(content) ==
+                CanonicalPtr(button->folderToolTipContent)) {
+            toolTip.Content(button->originalToolTipContent);
+        }
+
+        auto element = button->element.get();
+        if (button->ownToolTipSet && element) {
+            auto current = wuxc::ToolTipService::GetToolTip(element);
+            if (current && CanonicalPtr(current) == CanonicalPtr(toolTip)) {
+                wuxc::ToolTipService::SetToolTip(element,
+                                                 button->originalToolTip);
+            }
+        }
+    });
+
+    button->hostToolTip = nullptr;
+    button->hostToolTipOpenedToken = {};
+    button->originalToolTipContent = nullptr;
+    button->folderToolTipContent = nullptr;
+    button->ownToolTipSet = false;
+    button->originalToolTip = nullptr;
 }
 
 // Handlers on the template root, which run before the button's own handling.
@@ -3783,10 +4014,22 @@ wuxc::Grid CreateDrawnFolder(void* taskbarKey, int folder) {
     button.Children().Append(image);
 
     std::wstring name = FolderDisplayName(folder);
-    wuxc::ToolTipService::SetToolTip(button,
-                                     winrt::box_value(winrt::hstring(name)));
     wux::Automation::AutomationProperties::SetName(button,
                                                    winrt::hstring(name));
+
+    // Lists the folder's apps, like the tooltip of a folder on a closed app.
+    wuxc::ToolTip toolTip;
+    toolTip.Content(winrt::box_value(winrt::hstring(name)));
+    toolTip.Opened([taskbarKey, folder](wf::IInspectable const& sender,
+                                        auto const&) {
+        Guarded([&] {
+            if (ButtonState* carrier = FindFolderCarrier(taskbarKey, folder)) {
+                sender.as<wuxc::ToolTip>().Content(
+                    BuildFolderToolTipContent(carrier));
+            }
+        });
+    });
+    wuxc::ToolTipService::SetToolTip(button, toolTip);
 
     auto drawnFolder = [taskbarKey, folder]() -> DrawnFolder* {
         SectionsTaskbar* taskbar = FindSectionsTaskbar(taskbarKey);
@@ -4664,6 +4907,7 @@ void DetachButton(ButtonState* button) {
     auto element = button->element.get();
 
     Guarded([&] { RestoreIcon(button); });
+    RestoreHostToolTip(button);
     RestoreSectionLayout(button);
 
     if (element) {
@@ -4853,6 +5097,7 @@ void ApplyButtonState(ButtonState* button, bool host, bool collapse) {
     if (collapse) {
         if (button->isHost) {
             RestoreIcon(button);
+            RestoreHostToolTip(button);
             button->isHost = false;
         }
         if (!button->collapsedByUs) {
@@ -4870,8 +5115,10 @@ void ApplyButtonState(ButtonState* button, bool host, bool collapse) {
     if (host) {
         button->isHost = true;
         ApplyHostIcon(button);
+        ApplyHostToolTip(button, element);
     } else if (button->isHost) {
         RestoreIcon(button);
+        RestoreHostToolTip(button);
         button->isHost = false;
     }
 }
