@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.10
+// @version         1.11
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -50,11 +50,10 @@ listed in more than one folder, the first folder wins.
 
 * The folder sits where its first closed app is pinned. The apps listed after
   it are hidden from the taskbar.
-* When every app in a folder is open, for example the only app of a folder
-  with one app, the folder stays on the taskbar: it sits on its first app's
-  taskbar icon. The folder then shows that the app is open, like the app's
-  own icon would, and hovering it shows the app's window previews. Clicking
-  the folder still opens its menu, where you can switch to the app.
+* When every app in a folder is open (for example, the only app of a folder
+  with one app), the folder stays on the taskbar right in front of its first
+  app, and each open app keeps its own taskbar icon. Click the folder to open
+  its menu as usual.
 * Clicking the folder opens its menu. Click an app to open it.
 * Drag the folder to move it, like any other pinned icon. This moves the app
   the folder sits on, so the folder stays in its new spot.
@@ -69,8 +68,7 @@ listed in more than one folder, the first folder wins.
   the list in the settings.
   If you remove every app in a folder, the folder disappears, so its menu
   can't restore them. Change its app list in the settings to bring them back.
-* An open app gets its own taskbar icon (unless the folder sits on it, see
-  above) and also stays in the folder menu,
+* An open app gets its own taskbar icon and also stays in the folder menu,
   marked "Open", or with its window count when it has more than one, for
   example "Open | 2". Clicking it in the menu switches to it, and its Close
   button (Close all, with more than one window) closes its windows. Apps
@@ -98,8 +96,8 @@ groups:
 * Open apps are a separate group in the middle of the taskbar, like the
   centered Windows 11 taskbar. That includes pinned apps while they're open:
   an open pinned app moves to the middle, and goes back to its pinned spot
-  when it's closed. A folder stays with the pinned apps even while it sits on
-  an open app.
+  when it's closed. A folder stays with the pinned apps even while all its
+  apps are open.
 
 If the open apps don't fit in the middle, they move right as far as the
 system tray, and then sit right after the pinned apps.
@@ -141,9 +139,11 @@ pinned keeps its own taskbar icon while it's open.
 
 * Windows 11 taskbar only. The Windows 10 taskbar, and the Windows 10 taskbar
   restored by ExplorerPatcher, aren't supported.
-* The folder sits on one of its apps' taskbar icons. While every app in a
-  folder is open, the app it sits on has no taskbar icon of its own, and its
-  jump list (right-click menu) can't be opened from the taskbar.
+* A folder sits on one of its closed apps' taskbar spots. While every app in a
+  folder is open, there's no such spot, so the mod draws the folder icon
+  itself, in space it makes in front of the folder's first app. That folder
+  can't be dragged, and looks slightly different from real taskbar icons when
+  hovered.
 * Keyboard shortcuts such as Win+1 still launch the app the folder sits on.
 * With **Keep open apps apart from pinned apps**, an open pinned app is only
   drawn in the middle, so Windows may still open some things, such as its jump
@@ -153,9 +153,7 @@ pinned keeps its own taskbar icon while it's open.
 * Dragging the folder and opening its menu with a left click rely on Windows'
   debugging symbols for the taskbar, which Windhawk downloads the first time
   the mod loads. If that fails, the folder still opens its menu when clicked
-  but can't be dragged. Two parts of the taskbar are used: one for folders
-  with a closed app, and one for folders whose apps are all open, so either
-  kind can lose dragging on its own.
+  but can't be dragged.
 
 ## If an app isn't added to its folder
 
@@ -470,6 +468,9 @@ struct ButtonState {
     int order = 0;
 
     bool isHost = false;
+    // Every app of the folder is open, and this is the first one: the mod
+    // draws the folder in front of it.
+    bool carriesFolder = false;
     bool collapsedByUs = false;
     bool iconOverridden = false;
     bool applyingIcon = false;
@@ -585,20 +586,8 @@ using CTaskBand_Launch_t = long(WINAPI*)(void* pThis,
 CTaskBand_Launch_t CTaskBand_Launch_Original;
 bool g_launchHooked = false;
 
-// Every click on a taskbar button, open or not, goes through here. With it, a
-// click on a folder that sits on an open app can be turned into the folder
-// menu too, instead of switching to the app.
-using CTaskListWnd__HandleClick_t = void(WINAPI*)(void* pThis,
-                                                  void* taskBtnGroup,
-                                                  int taskItemIndex,
-                                                  int clickAction,
-                                                  int param4,
-                                                  int param5);
-CTaskListWnd__HandleClick_t CTaskListWnd__HandleClick_Original;
-bool g_clickHooked = false;
-
 // Apps seen with a closed taskbar button, which means they're pinned. A folder
-// whose apps are all open only sits on a pinned app.
+// whose apps are all open is only drawn in front of a pinned app.
 std::vector<std::wstring> g_closedPinnedAppIds;
 
 DWORD g_uiThreadId = 0;
@@ -2931,8 +2920,11 @@ void ShowClassicMenuNow() {
     }
 }
 
-void ShowFolderMenu(ButtonState* host) {
-    auto element = host->element.get();
+// Shows the folder's menu. anchor is the element it opens from: by default
+// the host button, or the folder the mod draws when all its apps are open.
+void ShowFolderMenu(ButtonState* host,
+                    wux::FrameworkElement const& anchor = nullptr) {
+    auto element = anchor ? anchor : host->element.get();
     if (!element || host->folder < 0) {
         return;
     }
@@ -2959,20 +2951,6 @@ void ShowFolderMenu(ButtonState* host) {
     }
 }
 
-// Whether a left or middle press on a folder goes through to the taskbar, so
-// that the folder can be dragged, and the click is turned into the folder menu
-// by a hook. A folder on an open app needs the click hook: without it the
-// taskbar only reports a click on an open app as switching to it.
-bool HostPressPassesThrough(ButtonState* button) {
-    return g_clickHooked || (g_launchHooked && !button->running);
-}
-
-// Whether the mod handles every click on the button itself.
-bool HostTakesOverClicks(void* key) {
-    ButtonState* button = FindButton(key);
-    return button && button->isHost && !HostPressPassesThrough(button);
-}
-
 // Handlers on the template root, which run before the button's own handling.
 // With the launch hook, only right clicks on a folder are taken over here: a
 // left press goes through so that the folder can be dragged, and the click is
@@ -2991,7 +2969,7 @@ void OnPointerPressed(void* key, wux::Input::PointerRoutedEventArgs const& e) {
 
     bool rightButton =
         e.GetCurrentPoint(root).Properties().IsRightButtonPressed();
-    if (HostPressPassesThrough(button) && !rightButton) {
+    if (g_launchHooked && !rightButton) {
         return;
     }
 
@@ -3014,7 +2992,7 @@ void OnPointerReleased(void* key, wux::Input::PointerRoutedEventArgs const& e) {
     bool wasPressed = g_press.active && g_press.key == key &&
                       g_press.pointerId == e.Pointer().PointerId();
     if (!wasPressed) {
-        if (button->isHost && !HostPressPassesThrough(button)) {
+        if (button->isHost && !g_launchHooked) {
             e.Handled(true);
         }
         return;
@@ -3057,7 +3035,7 @@ void OnButtonPointerDown(void* key, wux::Input::PointerRoutedEventArgs const& e)
         button->frozenRunning = button->running;
     }
 
-    if (!button->isHost || !HostPressPassesThrough(button)) {
+    if (!g_launchHooked || !button->isHost) {
         return;
     }
 
@@ -3131,25 +3109,6 @@ long WINAPI CTaskBand_Launch_Hook(void* pThis,
     }
 
     return CTaskBand_Launch_Original(pThis, taskGroup, point, options);
-}
-
-void WINAPI CTaskListWnd__HandleClick_Hook(void* pThis,
-                                           void* taskBtnGroup,
-                                           int taskItemIndex,
-                                           int clickAction,
-                                           int param4,
-                                           int param5) {
-    void* key = nullptr;
-    if (TakeHostClick(&key)) {
-        Wh_Log(L"Showing a folder menu instead of click action %d",
-               clickAction);
-        g_menuRequestKey = key;
-        PostMessageW(g_hwnd, kMsgShowFolderMenu, 0, 0);
-        return;
-    }
-
-    CTaskListWnd__HandleClick_Original(pThis, taskBtnGroup, taskItemIndex,
-                                       clickAction, param4, param5);
 }
 
 bool IsHostButton(void* key) {
@@ -3262,9 +3221,9 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
     button->tappedToken = root.Tapped(
         [key](auto const&, wux::Input::TappedRoutedEventArgs const& e) {
             Guarded([&] {
-                // With the click or launch hook, a left click has to reach
-                // the taskbar for the hook to turn it into the folder menu.
-                if (HostTakesOverClicks(key)) {
+                // With the launch hook, a left click has to reach the taskbar
+                // for the hook to turn it into the folder menu.
+                if (!g_launchHooked && IsHostButton(key)) {
                     e.Handled(true);
                 }
             });
@@ -3272,9 +3231,9 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
     button->doubleTappedToken = root.DoubleTapped(
         [key](auto const&, wux::Input::DoubleTappedRoutedEventArgs const& e) {
             Guarded([&] {
-                // With the click or launch hook, a left click has to reach
-                // the taskbar for the hook to turn it into the folder menu.
-                if (HostTakesOverClicks(key)) {
+                // With the launch hook, a left click has to reach the taskbar
+                // for the hook to turn it into the folder menu.
+                if (!g_launchHooked && IsHostButton(key)) {
                     e.Handled(true);
                 }
             });
@@ -3335,19 +3294,36 @@ void AttachTemplate(ButtonState* button, wux::FrameworkElement const& element) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Open apps kept apart from pinned apps (separateRunning)
+// Taskbar row layout: open apps kept apart from pinned apps (separateRunning),
+// and folders whose apps are all open.
 //
 // The taskbar lays out its buttons in one row: pinned apps in their pinned
 // order (an open pinned app keeps its pinned spot), then other open apps. The
 // mod only adds margins to that row, so that the taskbar's own layout, and
 // with it dragging, keeps working:
-// * The last closed pinned button (the end of the pinned section) gets a right
-//   margin that puts the open apps after it in the middle of the taskbar.
-// * An open pinned app before it is collapsed to no width with a negative
-//   margin and drawn among the open apps with a TranslateTransform. Its space
-//   there is part of that right margin.
+// * A folder whose apps are all open has no closed button to sit on. Its
+//   first open pinned app (the carrier) gets a left margin as wide as itself,
+//   and the mod draws a folder button of its own there, in an overlay canvas.
+// * With separateRunning, the last button of the pinned section (a closed
+//   pinned app, a folder, or a carrier's folder space) gets a right margin
+//   that puts the open apps after it in the middle of the taskbar. An open
+//   pinned app before it is collapsed to no width with a negative margin and
+//   drawn among the open apps with a TranslateTransform. Its space there is
+//   part of that right margin.
 // Everything is recomputed after each layout pass of the taskbar, except while
 // a button is pressed (e.g. being dragged), when the row's geometry is in flux.
+
+// A folder button drawn by the mod, for a folder whose apps are all open.
+struct DrawnFolder {
+    int folder = -1;
+    winrt::weak_ref<wuxc::Grid> element;
+    winrt::weak_ref<wuxc::Border> highlight;
+    winrt::weak_ref<wuxc::Image> image;
+    bool hovered = false;
+    bool pressed = false;
+    uint32_t pointerId = 0;
+    bool seen = false;
+};
 
 struct SectionsTaskbar {
     void* key = nullptr;
@@ -3355,10 +3331,12 @@ struct SectionsTaskbar {
     winrt::event_token layoutUpdatedToken{};
     winrt::weak_ref<wux::FrameworkElement> trayFrame;
     bool trayLookedUp = false;
-    // The separator line, in a canvas added on top of the repeater.
+    // A canvas added on top of the repeater, holding the separator line and
+    // drawn folders.
     winrt::weak_ref<wuxc::Panel> overlayParent;
     winrt::weak_ref<wuxc::Canvas> overlay;
     winrt::weak_ref<wuxc::Border> separator;
+    std::vector<DrawnFolder> drawnFolders;
     bool loggedCentered = false;
 };
 
@@ -3375,13 +3353,9 @@ struct SectionItem {
     wux::Thickness base{};
     // The space the button takes in the row with its own margin.
     double extent = 0;
+    // Where the button's space in the row starts.
+    double slotStart = 0;
 };
-
-// Open apps go in the middle, except one that a folder sits on (when all the
-// folder's apps are open), which stays with the pinned apps.
-bool InRunningSection(ButtonState* button) {
-    return button->running && !button->isHost;
-}
 
 bool IsPointerHeld(ButtonState* button) {
     return button->pointerDown &&
@@ -3558,13 +3532,41 @@ wux::FrameworkElement FindDescendantByClassName(
     return nullptr;
 }
 
-wuxc::Border EnsureSeparator(SectionsTaskbar& taskbar,
-                             wux::FrameworkElement const& repeater) {
-    auto separator = taskbar.separator.get();
+
+SectionsTaskbar* FindSectionsTaskbar(void* key) {
+    for (auto& taskbar : g_sectionsTaskbars) {
+        if (taskbar->key == key) {
+            return taskbar.get();
+        }
+    }
+    return nullptr;
+}
+
+DrawnFolder* FindDrawnFolder(SectionsTaskbar& taskbar, int folder) {
+    for (auto& drawn : taskbar.drawnFolders) {
+        if (drawn.folder == folder) {
+            return &drawn;
+        }
+    }
+    return nullptr;
+}
+
+// The open app a drawn folder is in front of.
+ButtonState* FindFolderCarrier(void* taskbarKey, int folder) {
+    for (auto& button : g_buttons) {
+        if (button->carriesFolder && button->folder == folder &&
+            button->repeaterKey == taskbarKey) {
+            return button.get();
+        }
+    }
+    return nullptr;
+}
+
+wuxc::Canvas EnsureOverlay(SectionsTaskbar& taskbar,
+                           wux::FrameworkElement const& repeater) {
     auto overlay = taskbar.overlay.get();
-    if (separator && overlay &&
-        wux::Media::VisualTreeHelper::GetParent(overlay)) {
-        return separator;
+    if (overlay && wux::Media::VisualTreeHelper::GetParent(overlay)) {
+        return overlay;
     }
 
     auto parent = wux::Media::VisualTreeHelper::GetParent(repeater)
@@ -3574,41 +3576,21 @@ wuxc::Border EnsureSeparator(SectionsTaskbar& taskbar,
     }
 
     // A canvas with no size at the top left of the repeater's parent. It
-    // doesn't take part in its layout, and the line is placed in it by
-    // coordinates.
+    // doesn't take part in its layout, and its children are placed in it by
+    // coordinates. Having no background, only its children take input.
     wuxc::Canvas canvas;
-    canvas.IsHitTestVisible(false);
     canvas.HorizontalAlignment(wux::HorizontalAlignment::Left);
     canvas.VerticalAlignment(wux::VerticalAlignment::Top);
-
-    wuxc::Border line;
-    line.IsHitTestVisible(false);
-    line.Width(kSeparatorWidth);
-    line.CornerRadius(wux::CornerRadius{kSeparatorWidth / 2,
-                                        kSeparatorWidth / 2,
-                                        kSeparatorWidth / 2,
-                                        kSeparatorWidth / 2});
-    line.Opacity(kSeparatorOpacity);
-    line.Visibility(wux::Visibility::Collapsed);
-    canvas.Children().Append(line);
-
     parent.Children().Append(canvas);
 
     taskbar.overlayParent = winrt::make_weak(parent);
     taskbar.overlay = winrt::make_weak(canvas);
-    taskbar.separator = winrt::make_weak(line);
-    return line;
+    taskbar.separator = nullptr;
+    taskbar.drawnFolders.clear();
+    return canvas;
 }
 
-void HideSeparator(SectionsTaskbar& taskbar) {
-    if (auto separator = taskbar.separator.get()) {
-        if (separator.Visibility() != wux::Visibility::Collapsed) {
-            separator.Visibility(wux::Visibility::Collapsed);
-        }
-    }
-}
-
-void RemoveSeparator(SectionsTaskbar& taskbar) {
+void RemoveOverlay(SectionsTaskbar& taskbar) {
     auto parent = taskbar.overlayParent.get();
     auto overlay = taskbar.overlay.get();
     if (parent && overlay) {
@@ -3621,30 +3603,49 @@ void RemoveSeparator(SectionsTaskbar& taskbar) {
     taskbar.overlayParent = nullptr;
     taskbar.overlay = nullptr;
     taskbar.separator = nullptr;
+    taskbar.drawnFolders.clear();
+}
+
+void HideSeparator(SectionsTaskbar& taskbar) {
+    if (auto separator = taskbar.separator.get()) {
+        if (separator.Visibility() != wux::Visibility::Collapsed) {
+            separator.Visibility(wux::Visibility::Collapsed);
+        }
+    }
 }
 
 // Draws the separator line at x, in the repeater's coordinates, centered
-// vertically on the last pinned button.
+// vertically on a button of the row.
 void PlaceSeparator(SectionsTaskbar& taskbar,
                     wux::FrameworkElement const& repeater,
-                    SectionItem const& pinnedEnd,
+                    SectionItem const& reference,
                     double x) {
-    auto separator = EnsureSeparator(taskbar, repeater);
-    auto overlay = taskbar.overlay.get();
-    if (!separator || !overlay) {
+    auto overlay = EnsureOverlay(taskbar, repeater);
+    if (!overlay) {
         return;
     }
 
-    double buttonHeight = pinnedEnd.element.ActualHeight();
+    auto separator = taskbar.separator.get();
+    if (!separator) {
+        separator = wuxc::Border();
+        separator.IsHitTestVisible(false);
+        separator.Width(kSeparatorWidth);
+        separator.CornerRadius(wux::CornerRadius{
+            kSeparatorWidth / 2, kSeparatorWidth / 2, kSeparatorWidth / 2,
+            kSeparatorWidth / 2});
+        separator.Opacity(kSeparatorOpacity);
+        overlay.Children().Append(separator);
+        taskbar.separator = winrt::make_weak(separator);
+    }
+
+    double buttonHeight = reference.element.ActualHeight();
     double height =
         std::max(12.0, std::round(buttonHeight * kSeparatorHeightRatio));
     auto origin = repeater.TransformToVisual(overlay).TransformPoint(
-        {static_cast<float>(x), 0});
-    auto buttonTop = pinnedEnd.element.TransformToVisual(overlay)
-                         .TransformPoint({0, 0})
-                         .Y;
+        {static_cast<float>(x),
+         static_cast<float>(reference.element.ActualOffset().y)});
     double left = std::round(origin.X);
-    double top = std::round(buttonTop + (buttonHeight - height) / 2);
+    double top = std::round(origin.Y + (buttonHeight - height) / 2);
 
     if (wuxc::Canvas::GetLeft(separator) != left) {
         wuxc::Canvas::SetLeft(separator, left);
@@ -3657,7 +3658,7 @@ void PlaceSeparator(SectionsTaskbar& taskbar,
     }
 
     // The color of the taskbar's text, which follows the light or dark theme.
-    if (auto control = pinnedEnd.element.try_as<wuxc::Control>()) {
+    if (auto control = reference.element.try_as<wuxc::Control>()) {
         auto brush = control.Foreground();
         if (brush && separator.Background() != brush) {
             separator.Background(brush);
@@ -3669,8 +3670,262 @@ void PlaceSeparator(SectionsTaskbar& taskbar,
     }
 }
 
+// The hover or press background of a drawn folder: the taskbar's text color,
+// faint, like the taskbar's own buttons.
+wux::Media::Brush DrawnFolderHighlight(ButtonState* carrier, bool pressed) {
+    winrt::Windows::UI::Color color{0xFF, 0xFF, 0xFF, 0xFF};
+    if (auto element = carrier ? carrier->element.get() : nullptr) {
+        if (auto control = element.try_as<wuxc::Control>()) {
+            if (auto brush = control.Foreground()
+                                 .try_as<wux::Media::SolidColorBrush>()) {
+                color = brush.Color();
+            }
+        }
+    }
+    color.A = pressed ? 0x10 : 0x18;
+    return wux::Media::SolidColorBrush(color);
+}
+
+void UpdateDrawnFolderHighlight(void* taskbarKey, int folder) {
+    SectionsTaskbar* taskbar = FindSectionsTaskbar(taskbarKey);
+    DrawnFolder* drawn = taskbar ? FindDrawnFolder(*taskbar, folder) : nullptr;
+    auto highlight = drawn ? drawn->highlight.get() : nullptr;
+    if (!highlight) {
+        return;
+    }
+
+    if (!drawn->hovered && !drawn->pressed) {
+        highlight.Background(nullptr);
+        return;
+    }
+    highlight.Background(DrawnFolderHighlight(
+        FindFolderCarrier(taskbarKey, folder), drawn->pressed));
+}
+
+wuxc::Grid CreateDrawnFolder(void* taskbarKey, int folder) {
+    wuxc::Grid button;
+    // A background, even a transparent one, makes the whole area take input.
+    button.Background(TransparentBrush());
+
+    wuxc::Border highlight;
+    highlight.CornerRadius(wux::CornerRadius{4, 4, 4, 4});
+    highlight.Margin(wux::Thickness{2, 4, 2, 4});
+    highlight.IsHitTestVisible(false);
+    button.Children().Append(highlight);
+
+    wuxc::Image image;
+    image.HorizontalAlignment(wux::HorizontalAlignment::Center);
+    image.VerticalAlignment(wux::VerticalAlignment::Center);
+    image.IsHitTestVisible(false);
+    button.Children().Append(image);
+
+    std::wstring name = FolderDisplayName(folder);
+    wuxc::ToolTipService::SetToolTip(button,
+                                     winrt::box_value(winrt::hstring(name)));
+    wux::Automation::AutomationProperties::SetName(button,
+                                                   winrt::hstring(name));
+
+    auto drawnFolder = [taskbarKey, folder]() -> DrawnFolder* {
+        SectionsTaskbar* taskbar = FindSectionsTaskbar(taskbarKey);
+        return taskbar ? FindDrawnFolder(*taskbar, folder) : nullptr;
+    };
+
+    button.PointerEntered([=](auto const&, auto const&) {
+        Guarded([&] {
+            if (DrawnFolder* drawn = drawnFolder()) {
+                drawn->hovered = true;
+                UpdateDrawnFolderHighlight(taskbarKey, folder);
+            }
+        });
+    });
+    button.PointerExited([=](auto const&, auto const&) {
+        Guarded([&] {
+            if (DrawnFolder* drawn = drawnFolder()) {
+                drawn->hovered = false;
+                UpdateDrawnFolderHighlight(taskbarKey, folder);
+            }
+        });
+    });
+    button.PointerPressed(
+        [=](wf::IInspectable const& sender,
+            wux::Input::PointerRoutedEventArgs const& e) {
+            Guarded([&] {
+                e.Handled(true);
+                DrawnFolder* drawn = drawnFolder();
+                if (!drawn) {
+                    return;
+                }
+                drawn->pressed = true;
+                drawn->pointerId = e.Pointer().PointerId();
+                sender.as<wux::UIElement>().CapturePointer(e.Pointer());
+                UpdateDrawnFolderHighlight(taskbarKey, folder);
+            });
+        });
+    button.PointerReleased(
+        [=](wf::IInspectable const& sender,
+            wux::Input::PointerRoutedEventArgs const& e) {
+            Guarded([&] {
+                e.Handled(true);
+                DrawnFolder* drawn = drawnFolder();
+                if (!drawn || !drawn->pressed ||
+                    drawn->pointerId != e.Pointer().PointerId()) {
+                    return;
+                }
+                drawn->pressed = false;
+                auto element = sender.as<wux::FrameworkElement>();
+                element.ReleasePointerCapture(e.Pointer());
+                UpdateDrawnFolderHighlight(taskbarKey, folder);
+
+                // Like a regular button, releasing outside of it cancels the
+                // click.
+                auto position = e.GetCurrentPoint(element).Position();
+                if (position.X < 0 || position.Y < 0 ||
+                    position.X > element.ActualWidth() ||
+                    position.Y > element.ActualHeight()) {
+                    return;
+                }
+
+                if (ButtonState* carrier =
+                        FindFolderCarrier(taskbarKey, folder)) {
+                    ShowFolderMenu(carrier, element);
+                }
+            });
+        });
+    button.PointerCaptureLost([=](auto const&, auto const&) {
+        Guarded([&] {
+            if (DrawnFolder* drawn = drawnFolder()) {
+                drawn->pressed = false;
+                UpdateDrawnFolderHighlight(taskbarKey, folder);
+            }
+        });
+    });
+    // Keep the taskbar's own menu away, as on a folder on a closed app.
+    button.RightTapped([](auto const&, wux::Input::RightTappedRoutedEventArgs
+                                           const& e) { e.Handled(true); });
+    button.ContextRequested(
+        [](auto const&, wux::Input::ContextRequestedEventArgs const& e) {
+            e.Handled(true);
+        });
+
+    return button;
+}
+
+// Draws the folder that the item carries, in the space left in front of it:
+// from left (in the repeater's coordinates), the size of the item's button.
+void PlaceDrawnFolder(SectionsTaskbar& taskbar,
+                      wux::FrameworkElement const& repeater,
+                      SectionItem const& item,
+                      double left) {
+    auto overlay = EnsureOverlay(taskbar, repeater);
+    if (!overlay) {
+        return;
+    }
+
+    int folder = item.button->folder;
+    DrawnFolder* drawn = FindDrawnFolder(taskbar, folder);
+    if (drawn && !drawn->element.get()) {
+        std::erase_if(taskbar.drawnFolders,
+                      [folder](auto const& d) { return d.folder == folder; });
+        drawn = nullptr;
+    }
+    if (!drawn) {
+        auto element = CreateDrawnFolder(taskbar.key, folder);
+        overlay.Children().Append(element);
+
+        DrawnFolder newDrawn;
+        newDrawn.folder = folder;
+        newDrawn.element = winrt::make_weak(element);
+        newDrawn.highlight = winrt::make_weak(
+            element.Children().GetAt(0).as<wuxc::Border>());
+        newDrawn.image =
+            winrt::make_weak(element.Children().GetAt(1).as<wuxc::Image>());
+        taskbar.drawnFolders.push_back(std::move(newDrawn));
+        drawn = &taskbar.drawnFolders.back();
+        Wh_Log(L"Drawing folder %s in front of %s",
+               FolderDisplayName(folder).c_str(),
+               item.button->appId.c_str());
+    }
+    drawn->seen = true;
+
+    auto element = drawn->element.get();
+    auto image = drawn->image.get();
+    if (!element || !image) {
+        return;
+    }
+
+    auto origin = repeater.TransformToVisual(overlay).TransformPoint(
+        {static_cast<float>(left),
+         static_cast<float>(item.element.ActualOffset().y)});
+    double x = std::round(origin.X);
+    double y = std::round(origin.Y);
+    double width = item.width;
+    double height = item.element.ActualHeight();
+
+    if (wuxc::Canvas::GetLeft(element) != x) {
+        wuxc::Canvas::SetLeft(element, x);
+    }
+    if (wuxc::Canvas::GetTop(element) != y) {
+        wuxc::Canvas::SetTop(element, y);
+    }
+    if (element.Width() != width) {
+        element.Width(width);
+    }
+    if (element.Height() != height) {
+        element.Height(height);
+    }
+
+    // The same icon size as the app's.
+    double iconWidth = 24;
+    double iconHeight = 24;
+    if (auto appIcon = item.button->icon.get()) {
+        if (appIcon.ActualWidth() > 0 && appIcon.ActualHeight() > 0) {
+            iconWidth = appIcon.ActualWidth();
+            iconHeight = appIcon.ActualHeight();
+        }
+    }
+    if (image.Width() != iconWidth) {
+        image.Width(iconWidth);
+    }
+    if (image.Height() != iconHeight) {
+        image.Height(iconHeight);
+    }
+
+    auto icon = GetFolderIcon(folder);
+    if (icon && image.Source() != icon) {
+        image.Source(icon);
+    }
+}
+
+// Removes the drawn folders that weren't placed in this pass.
+void PruneDrawnFolders(SectionsTaskbar& taskbar) {
+    auto overlay = taskbar.overlay.get();
+    std::erase_if(taskbar.drawnFolders, [&](DrawnFolder& drawn) {
+        if (drawn.seen) {
+            drawn.seen = false;
+            return false;
+        }
+        auto element = drawn.element.get();
+        if (overlay && element) {
+            uint32_t index;
+            if (overlay.Children().IndexOf(element, index)) {
+                overlay.Children().RemoveAt(index);
+            }
+        }
+        return true;
+    });
+}
+
+void ClearRowLayout(SectionsTaskbar& taskbar,
+                    std::vector<SectionItem> const& items) {
+    for (auto& item : items) {
+        RestoreSectionLayout(item.button);
+    }
+    HideSeparator(taskbar);
+    PruneDrawnFolders(taskbar);
+}
+
 void ArrangeSections(SectionsTaskbar& taskbar) {
-    if (g_unloading || g_arrangingSections || !g_settings.separateRunning) {
+    if (g_unloading || g_arrangingSections) {
         return;
     }
 
@@ -3727,8 +3982,8 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
         items.push_back(std::move(item));
     }
 
-    // A pressed button may be being dragged. The groups are rearranged once
-    // it's released.
+    // A pressed button may be being dragged. The row is rearranged once it's
+    // released.
     if (frozen) {
         return;
     }
@@ -3737,10 +3992,7 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
     bool horizontal = rootWidth > 0 && rootWidth >= root.ActualHeight();
     if (!horizontal ||
         repeater.FlowDirection() == wux::FlowDirection::RightToLeft) {
-        for (auto& item : items) {
-            RestoreSectionLayout(item.button);
-        }
-        HideSeparator(taskbar);
+        ClearRowLayout(taskbar, items);
         return;
     }
 
@@ -3749,6 +4001,8 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
         item.width = item.element.ActualWidth();
         item.base = SectionBaseMargin(item.button, item.element);
         item.extent = item.base.Left + item.width + item.base.Right;
+        // Where the item's space in the row starts, without the mod's margin.
+        item.slotStart = item.x - item.element.Margin().Left;
     }
 
     if (haveIndexes) {
@@ -3769,22 +4023,63 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
         // By position. A collapsed button starts where the next one does.
         std::stable_sort(items.begin(), items.end(),
                          [](auto const& a, auto const& b) {
-                             if (std::abs(a.x - b.x) >= 0.5) {
-                                 return a.x < b.x;
+                             if (std::abs(a.slotStart - b.slotStart) >= 0.5) {
+                                 return a.slotStart < b.slotStart;
                              }
                              return a.button->transformOverridden &&
                                     !b.button->transformOverridden;
                          });
     }
 
+    const int count = static_cast<int>(items.size());
+
+    // The mod's margins for each item, and the shift of open pinned apps.
+    std::vector<double> extraLeft(count, 0);
+    std::vector<double> extraRight(count, 0);
+    std::vector<std::optional<double>> translate(count);
+
+    // A carrier's folder space in front of it is as wide as the button.
+    for (int i = 0; i < count; i++) {
+        if (items[i].button->carriesFolder) {
+            extraLeft[i] = items[i].extent;
+        }
+    }
+
+    auto finish = [&] {
+        for (int i = 0; i < count; i++) {
+            auto& item = items[i];
+            if (translate[i]) {
+                SetSectionTranslate(item.button, item.element, *translate[i]);
+            } else {
+                RestoreSectionTranslate(item.button, item.element);
+            }
+            SetSectionMargin(item.button, item.element, item.base,
+                             extraLeft[i], extraRight[i]);
+            if (item.button->carriesFolder) {
+                PlaceDrawnFolder(taskbar, repeater, item,
+                                 item.slotStart + item.base.Left);
+            }
+        }
+        PruneDrawnFolders(taskbar);
+    };
+
+    if (!g_settings.separateRunning) {
+        HideSeparator(taskbar);
+        finish();
+        return;
+    }
+
+    // The pinned section: closed pinned apps, folders, and the folder space
+    // of carriers. Every open app goes in the middle.
     int pinnedEnd = -1;
     double runningWidth = 0;
     bool anyRunning = false;
-    for (int i = 0; i < static_cast<int>(items.size()); i++) {
-        if (InRunningSection(items[i].button)) {
+    for (int i = 0; i < count; i++) {
+        if (items[i].button->running) {
             runningWidth += items[i].extent;
             anyRunning = true;
-        } else {
+        }
+        if (!items[i].button->running || items[i].button->carriesFolder) {
             pinnedEnd = i;
         }
     }
@@ -3799,7 +4094,8 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
     auto trayFrame = taskbar.trayFrame.get();
     if (!trayFrame && !taskbar.trayLookedUp) {
         taskbar.trayLookedUp = true;
-        trayFrame = FindDescendantByClassName(root, L"SystemTray.SystemTrayFrame");
+        trayFrame =
+            FindDescendantByClassName(root, L"SystemTray.SystemTrayFrame");
         taskbar.trayFrame = trayFrame ? winrt::make_weak(trayFrame) : nullptr;
     }
     if (trayFrame && trayFrame.XamlRoot() == root.XamlRoot()) {
@@ -3810,28 +4106,26 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
         }
     }
 
-    double runningStart = std::min(centerX - runningWidth / 2,
-                                   limitX - runningWidth);
+    double runningStart =
+        std::min(centerX - runningWidth / 2, limitX - runningWidth);
 
     if (pinnedEnd < 0) {
         // Only open apps: the first one moves the group to the middle.
-        for (size_t i = 0; i < items.size(); i++) {
-            auto& item = items[i];
-            RestoreSectionTranslate(item.button, item.element);
-            double extraLeft = 0;
-            if (i == 0 && anyRunning) {
-                double slotStart = item.x - item.element.Margin().Left;
-                extraLeft = std::max(0.0, std::round(runningStart - slotStart));
-            }
-            SetSectionMargin(item.button, item.element, item.base, extraLeft,
-                             0);
+        if (anyRunning) {
+            extraLeft[0] = std::max(
+                0.0, std::round(runningStart - items[0].slotStart));
         }
         HideSeparator(taskbar);
+        finish();
         return;
     }
 
     auto& end = items[pinnedEnd];
-    double pinnedRight = end.x + end.width + end.base.Right;
+    // The end of its space without the mod's right margin: a closed app's
+    // button, or a carrier's folder space.
+    double pinnedRight =
+        end.slotStart + (end.button->carriesFolder ? extraLeft[pinnedEnd] : 0) +
+        (end.button->running ? 0 : end.extent);
 
     if (!taskbar.loggedCentered && originX > rootWidth / 5) {
         taskbar.loggedCentered = true;
@@ -3849,37 +4143,27 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
         gap = minGap;
     }
 
-    // Open pinned apps before the end of the pinned apps are drawn in order at
-    // the start of the open apps, in space reserved by the margin after the
-    // last pinned app.
+    // Open apps up to the end of the pinned section are drawn in order at the
+    // start of the open apps, in space reserved by the margin after the
+    // pinned section. A negative right margin as wide as the button with its
+    // own margin makes each take no space in the row.
     double cursor = pinnedRight + gap;
     double movedWidth = 0;
-    for (int i = 0; i < pinnedEnd; i++) {
+    for (int i = 0; i <= pinnedEnd; i++) {
         auto& item = items[i];
-        if (!InRunningSection(item.button)) {
+        if (!item.button->running) {
             continue;
         }
 
-        // A negative right margin as wide as the button with its own margin
-        // makes it take no space in the row.
-        SetSectionMargin(item.button, item.element, item.base, 0,
-                         -item.extent);
-        SetSectionTranslate(item.button, item.element,
-                            cursor + item.base.Left - item.x);
+        extraRight[i] = -item.extent;
+        // Where the button is laid out once its margins are applied.
+        double laidOutX = item.slotStart + item.base.Left + extraLeft[i];
+        translate[i] = cursor + item.base.Left - laidOutX;
         cursor += item.extent;
         movedWidth += item.extent;
     }
 
-    for (int i = 0; i < static_cast<int>(items.size()); i++) {
-        auto& item = items[i];
-        if (i < pinnedEnd && InRunningSection(item.button)) {
-            continue;
-        }
-
-        RestoreSectionTranslate(item.button, item.element);
-        SetSectionMargin(item.button, item.element, item.base, 0,
-                         i == pinnedEnd ? gap + movedWidth : 0);
-    }
+    extraRight[pinnedEnd] += gap + movedWidth;
 
     if (g_settings.pinnedSeparator) {
         PlaceSeparator(taskbar, repeater, end,
@@ -3887,15 +4171,8 @@ void ArrangeSections(SectionsTaskbar& taskbar) {
     } else {
         HideSeparator(taskbar);
     }
-}
 
-SectionsTaskbar* FindSectionsTaskbar(void* key) {
-    for (auto& taskbar : g_sectionsTaskbars) {
-        if (taskbar->key == key) {
-            return taskbar.get();
-        }
-    }
-    return nullptr;
+    finish();
 }
 
 void TearDownSections() {
@@ -3906,7 +4183,7 @@ void TearDownSections() {
                 repeater.LayoutUpdated(taskbar->layoutUpdatedToken);
             }
         });
-        Guarded([&] { RemoveSeparator(*taskbar); });
+        Guarded([&] { RemoveOverlay(*taskbar); });
     }
     g_sectionsTaskbars.clear();
 
@@ -3917,7 +4194,13 @@ void TearDownSections() {
 }
 
 void ArrangeAllSections() {
-    if (!g_settings.separateRunning) {
+    bool needed = g_settings.separateRunning;
+    for (auto& button : g_buttons) {
+        if (button->carriesFolder) {
+            needed = true;
+        }
+    }
+    if (!needed) {
         TearDownSections();
         return;
     }
@@ -3931,7 +4214,7 @@ void ArrangeAllSections() {
             }
             return false;
         }
-        Guarded([&] { RemoveSeparator(*taskbar); });
+        Guarded([&] { RemoveOverlay(*taskbar); });
         return true;
     });
 
@@ -4017,6 +4300,7 @@ void DetachButton(ButtonState* button) {
     }
     button->collapsedByUs = false;
     button->isHost = false;
+    button->carriesFolder = false;
 
     Guarded([&] {
         auto image = button->icon.get();
@@ -4213,10 +4497,10 @@ void UpdateAll() {
     }
 
     // In each taskbar, a folder sits on its first member that isn't running.
-    // If they're all running, it sits on the first running one that's pinned,
-    // so that the folder stays on the taskbar.
+    // If they're all running, the mod draws it in front of the first running
+    // one that's pinned, which keeps its own button.
     std::map<std::pair<int, void*>, ButtonState*> hosts;
-    std::map<std::pair<int, void*>, ButtonState*> runningHosts;
+    std::map<std::pair<int, void*>, ButtonState*> carriers;
     for (auto& button : g_buttons) {
         if (button->folder < 0 || !button->element.get()) {
             continue;
@@ -4235,29 +4519,43 @@ void UpdateAll() {
             continue;
         }
 
-        // The current host wins a tie (e.g. an app with a button per window),
-        // so that the folder doesn't jump between them.
-        auto it = runningHosts.find(key);
-        if (it == runningHosts.end() || button->order < it->second->order ||
-            (button->order == it->second->order && button->isHost &&
-             !it->second->isHost)) {
-            runningHosts[key] = button.get();
+        // The current carrier wins a tie (e.g. an app with a button per
+        // window), so that the folder doesn't jump between them.
+        auto it = carriers.find(key);
+        if (it == carriers.end() || button->order < it->second->order ||
+            (button->order == it->second->order && button->carriesFolder &&
+             !it->second->carriesFolder)) {
+            carriers[key] = button.get();
         }
     }
 
-    for (auto& [key, button] : runningHosts) {
-        hosts.try_emplace(key, button);
+    for (auto& button : g_buttons) {
+        bool carries = false;
+        if (button->folder >= 0 && button->running) {
+            auto key = std::make_pair(button->folder, button->rootKey);
+            auto it = carriers.find(key);
+            carries = !hosts.contains(key) && it != carriers.end() &&
+                      it->second == button.get();
+        }
+        if (carries != button->carriesFolder) {
+            Wh_Log(L"%s: %s", button->appId.c_str(),
+                   carries ? (L"folder " + FolderDisplayName(button->folder) +
+                              L" drawn in front of it")
+                                 .c_str()
+                           : L"no folder drawn in front of it");
+            button->carriesFolder = carries;
+        }
     }
 
     for (auto& button : g_buttons) {
         Guarded([&] {
             bool host = false;
             bool collapse = false;
-            if (button->folder >= 0) {
+            if (button->folder >= 0 && !button->running) {
                 auto it =
                     hosts.find(std::make_pair(button->folder, button->rootKey));
                 host = it != hosts.end() && it->second == button.get();
-                collapse = !host && !button->running;
+                collapse = !host;
             }
             ApplyButtonState(button.get(), host, collapse);
         });
@@ -4752,9 +5050,8 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
 }
 
 // Lets a left click on a folder reach the taskbar, so that the folder can be
-// dragged, and turns the resulting launch (or, for a folder on an open app,
-// click) into the folder menu. Optional: if the symbols can't be found,
-// folders work but can't be dragged.
+// dragged, and turns the resulting launch into the folder menu. Optional: if
+// the symbols can't be found, folders work but can't be dragged.
 void HookTaskbarSymbols() {
     HMODULE taskbarModule =
         LoadLibraryExW(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -4775,22 +5072,6 @@ void HookTaskbarSymbols() {
         taskbarModule, taskbarDllHooks, ARRAYSIZE(taskbarDllHooks));
     if (!g_launchHooked) {
         Wh_Log(L"Couldn't hook CTaskBand::Launch, folders can't be dragged");
-    }
-
-    // Hooked separately, so that each works without the other.
-    WindhawkUtils::SYMBOL_HOOK clickHooks[] = {
-        {
-            {LR"(protected: void __cdecl CTaskListWnd::_HandleClick(struct ITaskBtnGroup *,int,enum CTaskListWnd::eCLICKACTION,int,int))"},
-            &CTaskListWnd__HandleClick_Original,
-            CTaskListWnd__HandleClick_Hook,
-        },
-    };
-
-    g_clickHooked = WindhawkUtils::HookSymbols(taskbarModule, clickHooks,
-                                               ARRAYSIZE(clickHooks));
-    if (!g_clickHooked) {
-        Wh_Log(L"Couldn't hook CTaskListWnd::_HandleClick, a folder whose apps "
-               L"are all open can't be dragged");
     }
 }
 
