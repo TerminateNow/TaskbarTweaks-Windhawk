@@ -2,7 +2,7 @@
 // @id              taskbar-app-folders
 // @name            Taskbar App Folders
 // @description     Group pinned taskbar apps into folders that open a menu of their apps when clicked (Windows 11)
-// @version         1.13
+// @version         1.14
 // @author          TerminateNow
 // @github          https://github.com/TerminateNow
 // @include         explorer.exe
@@ -153,8 +153,10 @@ pinned keeps its own taskbar icon while it's open.
   hovered.
 * Keyboard shortcuts such as Win+1 still launch the app the folder sits on.
 * With **Keep open apps apart from pinned apps**, an open app is only drawn in
-  its place among the open apps, so Windows may still open some things, such
-  as its jump list (right-click menu), where it would be without the option.
+  its place among the open apps. Its jump list (right-click menu) is moved
+  over it using Windows' debugging symbols for the taskbar; if those can't be
+  found, it opens where the app would be without the option, such as next to
+  its folder.
   While a pinned app or folder is being dragged, the groups aren't rearranged
   until it's dropped. The option is ignored on a taskbar laid out right to
   left.
@@ -630,6 +632,25 @@ using CTaskBand_Launch_t = long(WINAPI*)(void* pThis,
                                          void* point,
                                          int options);
 CTaskBand_Launch_t CTaskBand_Launch_Original;
+
+// Where the taskbar opens a button's jump list (right-click menu). It goes by
+// where the button is laid out, so for an app the mod draws elsewhere (an open
+// app moved among the open apps), it's moved over the app as drawn.
+using CTaskListWnd_ComputeJumpViewPosition_t =
+    HRESULT(WINAPI*)(void* pThis,
+                     void* taskBtnGroup,
+                     int param2,
+                     wf::Point* point,
+                     wux::HorizontalAlignment* horizontalAlignment,
+                     wux::VerticalAlignment* verticalAlignment);
+CTaskListWnd_ComputeJumpViewPosition_t
+    CTaskListWnd_ComputeJumpViewPosition_Original;
+
+// Set by a right press on a button the mod moved: the middle of the button as
+// drawn, in screen pixels, used by the next jump list opened soon after.
+std::atomic<ULONGLONG> g_jumpListAnchorTime = 0;
+std::atomic<LONG> g_jumpListAnchorX = 0;
+constexpr ULONGLONG kJumpListAnchorTimeoutMs = 3000;
 bool g_launchHooked = false;
 
 // Open apps are dragged by the mod while they're kept apart from pinned apps
@@ -3301,6 +3322,37 @@ void OnPointerReleased(void* key, wux::Input::PointerRoutedEventArgs const& e) {
 
 // Handlers on the button itself, added with handledEventsToo, so they see
 // every press and release whoever handles it.
+// A right press: if the mod draws the button away from where it's laid out,
+// the jump list it opens is moved over the button as drawn. Any other right
+// press clears that, so jump lists of other buttons open as usual.
+void SetJumpListAnchor(ButtonState* button,
+                       wux::FrameworkElement const& element,
+                       wf::Point position) {
+    g_jumpListAnchorTime = 0;
+
+    if (!button->transformOverridden || !button->translate ||
+        std::abs(button->translate.X()) < 0.5) {
+        return;
+    }
+
+    auto xamlRoot = element.XamlRoot();
+    double scale = xamlRoot ? xamlRoot.RasterizationScale() : 1.0;
+    if (!(scale > 0)) {
+        scale = 1.0;
+    }
+
+    // The cursor is at position within the button as drawn.
+    POINT cursor;
+    if (!GetCursorPos(&cursor)) {
+        return;
+    }
+    double centerX =
+        cursor.x + (element.ActualWidth() / 2 - position.X) * scale;
+
+    g_jumpListAnchorX = static_cast<LONG>(std::lround(centerX));
+    g_jumpListAnchorTime = GetTickCount64();
+}
+
 void OnButtonPointerDown(void* key, wux::Input::PointerRoutedEventArgs const& e) {
     ButtonState* button = FindButton(key);
     if (!button) {
@@ -3313,13 +3365,18 @@ void OnButtonPointerDown(void* key, wux::Input::PointerRoutedEventArgs const& e)
         button->frozenRunning = button->running;
     }
 
-    if (!g_launchHooked || !button->isHost) {
+    auto element = button->element.get();
+    if (!element) {
         return;
     }
 
-    auto element = button->element.get();
-    if (!element ||
-        e.GetCurrentPoint(element).Properties().IsRightButtonPressed()) {
+    auto point = e.GetCurrentPoint(element);
+    if (point.Properties().IsRightButtonPressed()) {
+        SetJumpListAnchor(button, element, point.Position());
+        return;
+    }
+
+    if (!g_launchHooked || !button->isHost) {
         return;
     }
 
@@ -3372,6 +3429,29 @@ bool TakeHostClick(void** key) {
 
     *key = click.key;
     return true;
+}
+
+HRESULT WINAPI CTaskListWnd_ComputeJumpViewPosition_Hook(
+    void* pThis,
+    void* taskBtnGroup,
+    int param2,
+    wf::Point* point,
+    wux::HorizontalAlignment* horizontalAlignment,
+    wux::VerticalAlignment* verticalAlignment) {
+    HRESULT result = CTaskListWnd_ComputeJumpViewPosition_Original(
+        pThis, taskBtnGroup, param2, point, horizontalAlignment,
+        verticalAlignment);
+
+    ULONGLONG anchorTime = g_jumpListAnchorTime.exchange(0);
+    if (SUCCEEDED(result) && point && anchorTime && !g_unloading &&
+        GetTickCount64() - anchorTime < kJumpListAnchorTimeoutMs) {
+        Wh_Log(L"Moving a jump list from x=%d to x=%d over the app as drawn",
+               static_cast<int>(point->X),
+               static_cast<int>(g_jumpListAnchorX.load()));
+        point->X = static_cast<float>(g_jumpListAnchorX.load());
+    }
+
+    return result;
 }
 
 long WINAPI CTaskBand_Launch_Hook(void* pThis,
@@ -5720,6 +5800,21 @@ void HookTaskbarSymbols() {
         taskbarModule, taskbarDllHooks, ARRAYSIZE(taskbarDllHooks));
     if (!g_launchHooked) {
         Wh_Log(L"Couldn't hook CTaskBand::Launch, folders can't be dragged");
+    }
+
+    // Hooked separately, so that each works without the other.
+    WindhawkUtils::SYMBOL_HOOK jumpListHooks[] = {
+        {
+            {LR"(protected: long __cdecl CTaskListWnd::_ComputeJumpViewPosition(struct ITaskBtnGroup *,int,struct Windows::Foundation::Point &,enum Windows::UI::Xaml::HorizontalAlignment &,enum Windows::UI::Xaml::VerticalAlignment &)const )"},
+            &CTaskListWnd_ComputeJumpViewPosition_Original,
+            CTaskListWnd_ComputeJumpViewPosition_Hook,
+        },
+    };
+
+    if (!WindhawkUtils::HookSymbols(taskbarModule, jumpListHooks,
+                                    ARRAYSIZE(jumpListHooks))) {
+        Wh_Log(L"Couldn't hook CTaskListWnd::_ComputeJumpViewPosition, jump "
+               L"lists of moved open apps open where they're laid out");
     }
 }
 
